@@ -46,16 +46,18 @@ with the milestone history.
 ## Install
 
 Once the `v0.1.0` release exists, the whole app is one flatpak command
-away, pinned to the exact bytes the release signed:
+away, two commands, pinned to the exact bytes the release signed:
 
-    flatpak install --user -y \
-      docker://ghcr.io/letdown2491/orchard@sha256:<digest from the release notes>
+    curl -LO https://github.com/Letdown2491/orchard/releases/latest/download/orchard-linux-x86_64.oci.tgz
+    flatpak install --user -y oci-archive:orchard-linux-x86_64.oci.tgz
 
-The digest is per-arch (x86_64 and aarch64 are separate pins); take the
-line for your arch from the release notes, or from the signed listing
-event on the rendezvous relays. It is the same command the Orchard
-client itself runs for every install, and flatpak is the one
-prerequisite Orchard has anyway. The install is per-user (flatpak's
+(On an aarch64 machine, use `orchard-linux-aarch64.oci.tgz`; the two
+arches are separate artifacts.) The archive is the same artifact the
+release signed, so the bytes are the pin. Not a `docker://ghcr.io`
+one-liner because that cannot work: flatpak's image fetch never
+authenticates, and ghcr always challenges (see DESIGN.md); the Orchard
+client sidesteps this by downloading the verified artifact itself and
+installing from the local layout. The install is per-user (flatpak's
 system-scope image install is broken; see DESIGN.md), so no polkit
 password appears. Updates after that first install come through
 Orchard's own catalog, not the command line.

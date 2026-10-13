@@ -384,6 +384,40 @@ ride it on every request; registries that never challenge (the demo registry) ke
 the plain path. The GITHUB_TOKEN needs `packages: write`; the ghcr package flips
 public in its settings after the first push.
 
+**Digest-pinned end to end, and the client owns the fetch (decided, v0.1.1).**
+The first real install exposed two gaps. First, the client's verify fetched
+registries with plain GETs, but ghcr always challenges anonymous pulls (401 plus
+`WWW-Authenticate: Bearer realm=...`), so every verify against ghcr died before
+the digest check; the fetch path now runs the same challenge flow the push path
+always had (parse realm/service/scope, fetch an anonymous token, retry once,
+reuse the token across manifest, index entry, and config fetches). Second, and
+bigger: flatpak's `docker://` image-install path cannot authenticate at all.
+It fetches bare (its image source never fetches a token on a challenge; the
+token-taking constructor exists but the location path does not call it), so
+`flatpak install docker://ghcr.io/...` answers "Server returned status 401" on
+1.18.4 and on main. The client therefore owns the whole fetch: after the
+manifest verify passes, it downloads the artifact into a local OCI image layout
+(`download_layout`: manifest checked against the pin, then config and layer
+blobs streamed and hashed against their own digests, `index.json` and
+`oci-layout` last, staging dir renamed into place so a partial download never
+poses as a layout), and hands flatpak `oci:<dir>`, the zero-setup local path
+that was always the most reliable. Layouts live under the cache root
+(`~/.cache/orchard/artifacts/<app-id>/<digest>`), content-addressed: an
+existing directory is a complete one and a retry skips the download.
+orchard-publish emits asset locations in digest form
+(`docker://ghcr.io/owner/repo@sha256:...`) so the verify and the download
+resolve immutable bytes even for listings published before the change. The
+docker:// one-liner bootstrap was dropped for the same reason: the release
+carries the artifact as an oci-archive per arch
+(`orchard-<arch>.oci.tgz`, attached by CI), and the README installs it with
+`curl` plus `flatpak install --user oci-archive:`. Since the tag no longer
+decides what a client installs, the workflow pushes per-arch tags
+(`--tag latest-<arch>`) so the matrix legs stop overwriting each other's handle
+for humans and container tools. The proof-file write accepts 201 alongside 200:
+the first matrix leg to finish creates `orchard.txt` (201 Created), the second
+updates it (200), and treating 201 as failure failed an otherwise green aarch64
+leg after every real step had succeeded.
+
 **Relay topology: the rendezvous set (decided).** Nostr relays do not gossip to
 each other, so a publisher and a reader must share at least one relay for anything
 to flow. The model is a small, public, versioned **rendezvous set**
@@ -436,13 +470,18 @@ opening items because they need the push, the signing secret, and a tag.
       verifies once the repo is public, since the raw URL of a private repo does
       not resolve. The workflow holds `contents: write` so CI's `--prove` can
       refresh the proof file.)
-- [x] The bootstrap story is a flatpak one-liner, pinned by digest:
-      every Orchard user has flatpak as a runtime prerequisite anyway, and
-      the self-publish artifact is already a flatpak OCI image, so
-      `flatpak install --user -y docker://<ghcr>@sha256:<pin>` is the
-      whole install: the same command the client runs, with the digest
-      from the release notes or the signed listing, one pin per arch. A
-      deb is the later, non-technical path (step zero only; updates come
+- [x] The bootstrap story is curl plus one flatpak command, pinned by
+      digest: every Orchard user has flatpak as a runtime prerequisite
+      anyway, and the self-publish artifact is already a flatpak OCI
+      image, so the release carries the artifact as an oci-archive per
+      arch and `curl -LO <release>/orchard-<arch>.oci.tgz &&
+      flatpak install --user -y oci-archive:orchard-<arch>.oci.tgz`
+      is the whole install. (Not `docker://<ghcr>@sha256:<pin>`:
+      flatpak's image fetch never authenticates, and ghcr always
+      challenges; see the v0.1.1 decision above. The client can run
+      that fetch because it speaks the token dance, and after this
+      bootstrap the client is the install path anyway.) A deb is the
+      later, non-technical path (step zero only; updates come
       through the catalog); a GitHub tarball is the optional fallback for
       flatpak-ancient hosts. Flip-day test: the exact command on a
       machine that never ran Orchard, and the update handoff when

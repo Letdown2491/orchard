@@ -7,9 +7,11 @@
 //!
 //! - `docker://<registry>/<repo>:<tag>`: the Docker Registry v2 HTTP API
 //!   (`/v2/<repo>/manifests/<ref>`, `/v2/<repo>/blobs/<digest>`), which is
-//!   what flatpak's own OCI support uses under the hood. Anonymous pulls on
-//!   no-auth and CDN-redirecting registries work; token-authenticated
-//!   registries (ghcr, quay) are a later milestone.
+//!   what flatpak's own OCI support uses under the hood. Anonymous pulls
+//!   work everywhere we ship to: no-auth registries directly, and
+//!   token-authenticated ones (ghcr, Docker Hub, quay) through the
+//!   standard challenge flow (a 401 with `WWW-Authenticate: Bearer`
+//!   names a token endpoint; an anonymous token fetch and retry).
 //! - `oci:<dir>`: a local OCI image layout (what `skopeo copy ... oci:` and
 //!   podman push produce), which is also flatpak's zero-setup install path.
 //!
@@ -19,6 +21,7 @@
 //! ini), and optional sizes; a manifest may be a per-arch manifest or an
 //! image index with a `platform` per entry.
 
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context as _, Result};
@@ -125,6 +128,10 @@ impl Location {
     /// What to hand to `flatpak install` as the image location. The
     /// digest form when we have it: flatpak then pulls the exact bytes
     /// that were verified, not whatever the tag points at now.
+    /// (Registry artifacts the client installs go through
+    /// [download_layout] instead: flatpak's docker:// path cannot
+    /// authenticate, so the client fetches the layout and installs
+    /// from `oci:`.)
     pub fn install_arg(&self) -> String {
         match self {
             Location::OciDir(path) => format!("oci:{}", path.display()),
@@ -229,15 +236,34 @@ fn verify_registry(
 ) -> Result<VerifyReport> {
     let base = registry_base(registry, scheme);
     let agent = agent();
-    // fetch by digest when we have one: immutable, so what we verify is
-    // exactly what the pin names; a tag resolves to whatever the
-    // registry currently serves, so the pin check still runs after
+    let mut fetch = RegistryFetch::new(&agent, repository);
+    let (manifest_bytes, digest) =
+        resolve_manifest(&mut fetch, &base, repository, reference, pinned)?;
+    let mut report = report_from_manifest(&manifest_bytes, &digest)?;
+    report.manifest_size = manifest_bytes.len() as u64;
+    // Config and layers come through the same registry.
+    finish_registry_report(&mut fetch, &base, repository, &mut report)?;
+    Ok(report)
+}
+
+/// The manifest bytes a registry reference resolves to. An explicit
+/// reference rides as given; otherwise the pin (immutable, so what we
+/// verify is exactly what the pin names); otherwise `latest`. A
+/// reference that resolves to an index selects this machine's arch
+/// entry. The pin check runs against the final manifest's digest.
+fn resolve_manifest(
+    fetch: &mut RegistryFetch<'_>,
+    base: &str,
+    repository: &str,
+    reference: Option<&str>,
+    pinned: Option<&str>,
+) -> Result<(Vec<u8>, String)> {
     let reference = reference
         .map(str::to_string)
         .or_else(|| pinned.map(str::to_string))
         .unwrap_or_else(|| "latest".to_string());
     let url = format!("{base}/v2/{repository}/manifests/{reference}");
-    let bytes = http_get(&agent, &url)?;
+    let bytes = fetch.get(&url)?;
 
     // A tag may resolve to an index; select this machine's arch entry.
     let parsed: serde_json::Value = serde_json::from_slice(&bytes)
@@ -256,26 +282,148 @@ fn verify_registry(
             .and_then(|d| d.as_str())
             .ok_or_else(|| anyhow!("index entry without digest at {url}"))?;
         let manifest_url = format!("{base}/v2/{repository}/manifests/{entry_digest}");
-        let manifest_bytes = http_get(&agent, &manifest_url)?;
+        let manifest_bytes = fetch.get(&manifest_url)?;
         let digest = sha256_digest(&manifest_bytes);
         check_pin(pinned, &digest)?;
-        let mut report = report_from_manifest(&manifest_bytes, &digest)?;
-        report.manifest_size = manifest_bytes.len() as u64;
-        // Config and layers come through the same registry.
-        finish_registry_report(&agent, &base, repository, &mut report)?;
-        return Ok(report);
+        return Ok((manifest_bytes, digest));
     }
 
     let digest = sha256_digest(&bytes);
     check_pin(pinned, &digest)?;
-    let mut report = report_from_manifest(&bytes, &digest)?;
-    report.manifest_size = bytes.len() as u64;
-    finish_registry_report(&agent, &base, repository, &mut report)?;
-    Ok(report)
+    Ok((bytes, digest))
 }
 
+/// Download a registry artifact into a local OCI image layout under
+/// `dest`: the manifest (checked against `pinned` before anything
+/// large moves), then the config and layer blobs, each streamed and
+/// hashed against its own digest. Ends with `index.json` and
+/// `oci-layout`, the exact shape `flatpak install oci:<dir>` reads.
+/// Returns the manifest digest. Registry locations only: an `oci:`
+/// location is already local bytes.
+pub fn download_layout(location: &Location, pinned: Option<&str>, dest: &Path) -> Result<String> {
+    let (registry, repository, scheme, reference) = match location {
+        Location::Registry {
+            registry,
+            repository,
+            digest,
+            tag,
+            scheme,
+        } => (registry, repository, scheme, digest.as_deref().or(tag.as_deref())),
+        Location::OciDir(_) => {
+            bail!("nothing to download: the location is already a local layout")
+        }
+    };
+    let base = registry_base(registry, scheme.as_deref());
+    let agent = agent();
+    let mut fetch = RegistryFetch::new(&agent, repository);
+    let (manifest_bytes, digest) =
+        resolve_manifest(&mut fetch, &base, repository, reference, pinned)?;
+
+    let parsed: serde_json::Value = serde_json::from_slice(&manifest_bytes)
+        .with_context(|| format!("parsing manifest {digest}"))?;
+    let config_digest = parsed["config"]["digest"]
+        .as_str()
+        .ok_or_else(|| anyhow!("manifest {digest} carries no config digest"))?;
+    let layers: Vec<(String, u64)> = parsed["layers"]
+        .as_array()
+        .unwrap_or(&Vec::new())
+        .iter()
+        .filter_map(|layer| {
+            let digest = layer.get("digest")?.as_str()?.to_string();
+            let size = layer.get("size").and_then(|s| s.as_u64()).unwrap_or(0);
+            Some((digest, size))
+        })
+        .collect();
+
+    // The layout is content-addressed by manifest digest: a completed
+    // twin means a previous run got it all, and rename-in makes the
+    // last step atomic.
+    let staging = dest.with_extension("part");
+    let _ = std::fs::remove_dir_all(&staging);
+    let blobs = staging.join("blobs/sha256");
+    std::fs::create_dir_all(&blobs).with_context(|| format!("creating {}", staging.display()))?;
+    let result = (|| -> Result<()> {
+        std::fs::write(blobs.join(digest.trim_start_matches("sha256:")), &manifest_bytes)?;
+        fetch_blob_to(&mut fetch, &base, repository, config_digest, &blobs)?;
+        for (layer_digest, _size) in &layers {
+            fetch_blob_to(&mut fetch, &base, repository, layer_digest, &blobs)?;
+        }
+        let index = serde_json::json!({
+            "schemaVersion": 2,
+            "manifests": [{
+                "mediaType": parsed["mediaType"].as_str().unwrap_or(MEDIA_MANIFEST_OCI),
+                "digest": digest,
+                "size": manifest_bytes.len(),
+            }],
+        });
+        std::fs::write(staging.join("index.json"), serde_json::to_vec_pretty(&index)?)?;
+        std::fs::write(
+            staging.join("oci-layout"),
+            "{\"imageLayoutVersion\":\"1.0.0\"}\n",
+        )?;
+        Ok(())
+    })();
+    match result {
+        Ok(()) => {
+            std::fs::rename(&staging, dest)
+                .with_context(|| format!("moving {} into place", staging.display()))?;
+            Ok(digest)
+        }
+        Err(err) => {
+            let _ = std::fs::remove_dir_all(&staging);
+            Err(err)
+        }
+    }
+}
+
+/// Fetch one blob (config or layer) by digest into a layout's blob
+/// directory, hashing the stream on the way: a byte that does not
+/// match the digest it was named by never lands.
+fn fetch_blob_to(
+    fetch: &mut RegistryFetch<'_>,
+    base: &str,
+    repository: &str,
+    digest: &str,
+    blobs: &Path,
+) -> Result<()> {
+    let url = format!("{base}/v2/{repository}/blobs/{digest}");
+    let response = fetch.get_response(&url)?;
+    let mut reader = response.into_reader();
+    let final_path = blobs.join(digest.trim_start_matches("sha256:"));
+    let tmp = final_path.with_extension("part");
+    let mut file =
+        std::fs::File::create(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = std::io::Read::read(&mut reader, &mut buffer)
+            .with_context(|| format!("reading body of {url}"))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+        file.write_all(&buffer[..read])
+            .with_context(|| format!("writing {}", tmp.display()))?;
+    }
+    let hashed: String = format!(
+        "sha256:{}",
+        hasher.finalize().iter().map(|b| format!("{b:02x}")).collect::<String>()
+    );
+    if hashed != digest {
+        let _ = std::fs::remove_file(&tmp);
+        bail!("{url} served {hashed}, named {digest}");
+    }
+    std::fs::rename(&tmp, &final_path)
+        .with_context(|| format!("moving {} into place", tmp.display()))?;
+    Ok(())
+}
+
+/// The OCI manifest media type, the default `index.json` entry type
+/// (ghcr serves these; a docker-typed manifest keeps its own string).
+const MEDIA_MANIFEST_OCI: &str = "application/vnd.oci.image.manifest.v1+json";
+
 fn finish_registry_report(
-    agent: &ureq::Agent,
+    fetch: &mut RegistryFetch<'_>,
     base: &str,
     repository: &str,
     report: &mut VerifyReport,
@@ -284,7 +432,7 @@ fn finish_registry_report(
     // (flatpak does at install), but the config blob carries the labels.
     if let Some(config_digest) = report.config_digest.clone() {
         let url = format!("{base}/v2/{repository}/blobs/{config_digest}");
-        let config_bytes = http_get(agent, &url)?;
+        let config_bytes = fetch.get(&url)?;
         apply_config_labels(&config_bytes, report);
     }
     Ok(())
@@ -307,17 +455,174 @@ fn registry_base(registry: &str, scheme: Option<&str>) -> String {
     format!("{scheme}://{registry}")
 }
 
-fn http_get(agent: &ureq::Agent, url: &str) -> Result<Vec<u8>> {
-    let response = agent
-        .get(url)
-        .set("Accept", MANIFEST_ACCEPT)
-        .call()
-        .with_context(|| format!("GET {url}"))?;
-    let mut reader = response.into_reader();
+/// A registry fetcher that speaks the standard token challenge. A 401
+/// whose `WWW-Authenticate` advertises `Bearer realm="..."` is an
+/// invitation to fetch a (possibly anonymous) token and retry; ghcr,
+/// Docker Hub, and quay all run this flow even for public repos. The
+/// token is fetched lazily once and reused across the manifest, index
+/// entry, and config fetches of one verify.
+struct RegistryFetch<'a> {
+    agent: &'a ureq::Agent,
+    repository: &'a str,
+    token: Option<String>,
+}
+
+impl<'a> RegistryFetch<'a> {
+    fn new(agent: &'a ureq::Agent, repository: &'a str) -> Self {
+        RegistryFetch {
+            agent,
+            repository,
+            token: None,
+        }
+    }
+
+    fn get(&mut self, url: &str) -> Result<Vec<u8>> {
+        let response = self.get_response(url)?;
+        read_body(response.into_reader(), url)
+    }
+
+    /// The raw response, through the challenge round: callers that
+    /// stream (artifact blobs) read the body themselves.
+    fn get_response(&mut self, url: &str) -> Result<ureq::Response> {
+        match self.send(url, self.token.as_deref()) {
+            // not a status error at all: connection, timeout, ...
+            Err(ureq::Error::Transport(t)) => Err(anyhow!("GET {url}: {t}")),
+            Err(ureq::Error::Status(401, response)) => {
+                // one challenge round: fetch a token from the challenge
+                // and retry once, so a real denial costs one round trip
+                if self.token.is_none()
+                    && let Some(challenge) = response.header("www-authenticate")
+                {
+                    let client = format!("orchard/{}", env!("CARGO_PKG_VERSION"));
+                    self.token = Some(token_from_challenge(
+                        challenge,
+                        self.repository,
+                        &client,
+                    )?);
+                    return self
+                        .send(url, self.token.as_deref())
+                        .map_err(|err| anyhow!("GET {url} after token: {err}"));
+                }
+                Err(anyhow!("GET {url}: status code 401"))
+            }
+            Err(ureq::Error::Status(code, _)) => Err(anyhow!("GET {url}: status code {code}")),
+            Ok(response) => Ok(response),
+        }
+    }
+
+    fn send(
+        &self,
+        url: &str,
+        token: Option<&str>,
+    ) -> std::result::Result<ureq::Response, ureq::Error> {
+        let mut request = self.agent.get(url).set("Accept", MANIFEST_ACCEPT);
+        if let Some(token) = token {
+            request = request.set("Authorization", &format!("Bearer {token}"));
+        }
+        request.call()
+    }
+}
+
+fn read_body(reader: impl std::io::Read, url: &str) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
-    std::io::Read::read_to_end(&mut reader, &mut bytes)
+    std::io::Read::read_to_end(&mut { reader }, &mut bytes)
         .with_context(|| format!("reading body of {url}"))?;
     Ok(bytes)
+}
+
+/// Turn a `WWW-Authenticate: Bearer realm="…",service="…",scope="…"`
+/// challenge into a token. The scope pins the pull to this one
+/// repository; the challenge's own scope is fine when present, since
+/// it names the same repo. Anonymous (no credentials) is the norm for
+/// public repos: the endpoint hands out an unprivileged token. The
+/// token endpoint takes query params and answers JSON with `token` or
+/// `access_token`; values are percent-encoded so hosts and repo names
+/// with unusual characters survive.
+fn token_from_challenge(challenge: &str, repository: &str, client_id: &str) -> Result<String> {
+    let (realm, token_url) = token_endpoint(challenge, repository, client_id)?;
+    let agent = ureq::AgentBuilder::new()
+        .timeout(std::time::Duration::from_secs(30))
+        .build();
+    let response = agent
+        .get(&token_url)
+        .set("Accept", "application/json")
+        .call()
+        .with_context(|| format!("GET token endpoint {realm}"))?;
+    let record: serde_json::Value = serde_json::from_reader(response.into_reader())
+        .with_context(|| format!("parsing token response from {realm}"))?;
+    let token = record
+        .get("token")
+        .or_else(|| record.get("access_token"))
+        .and_then(|token| token.as_str())
+        .ok_or_else(|| anyhow!("token response from {realm} carries no token"))?;
+    if token.is_empty() {
+        bail!("token response from {realm} carries an empty token");
+    }
+    Ok(token.to_string())
+}
+
+/// The pure half of [`token_from_challenge`]: the realm and the fully
+/// formed token URL for a challenge.
+fn token_endpoint(challenge: &str, repository: &str, client_id: &str) -> Result<(String, String)> {
+    let mut realm = None;
+    let mut service = None;
+    let mut scope = Some(format!("repository:{repository}:pull"));
+    // key="value" pairs; the scheme word and the first pair share the
+    // first comma segment ("Bearer realm=\"...\""), so drop the scheme
+    // word rather than the segment
+    for (index, part) in challenge.split(',').enumerate() {
+        let part = if index == 0 {
+            match part.trim().split_once(char::is_whitespace) {
+                Some((_scheme, rest)) => rest,
+                None => continue,
+            }
+        } else {
+            part.trim()
+        };
+        let (key, value) = part
+            .split_once('=')
+            .ok_or_else(|| anyhow!("malformed WWW-Authenticate entry {part:?}"))?;
+        let value = value.trim_matches('"');
+        match key.trim() {
+            "realm" => realm = Some(value.to_string()),
+            "service" => service = Some(value.to_string()),
+            "scope" => scope = Some(value.to_string()),
+            _ => {}
+        }
+    }
+    let realm = realm.ok_or_else(|| anyhow!("WWW-Authenticate without realm: {challenge:?}"))?;
+    let query: &[(&str, &str)] = &[
+        ("service", service.as_deref().unwrap_or("")),
+        ("scope", scope.as_deref().unwrap_or("")),
+        ("client_id", client_id),
+    ];
+    let encoded: Vec<String> = query
+        .iter()
+        .map(|(key, value)| {
+            format!(
+                "{}={}",
+                form_encode_component(key),
+                form_encode_component(value)
+            )
+        })
+        .collect();
+    let token_url = format!("{}?{}", realm, encoded.join("&"));
+    Ok((realm, token_url))
+}
+
+/// One `application/x-www-form-urlencoded` component: everything
+/// outside RFC 3986's unreserved set gets %XX.
+fn form_encode_component(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(byte as char)
+            }
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
 }
 
 /// Architecture aliases flatpak and OCI use for the same machine.
@@ -418,6 +723,8 @@ fn check_pin(pinned: Option<&str>, actual: &str) -> Result<()> {
 mod tests {
     use super::*;
 
+    const DIGEST_PIN: &str = "sha256:00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+
     /// Unique per test: tests run in parallel and must not share a layout.
     fn unique_dir(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
@@ -496,6 +803,51 @@ mod tests {
         (dir, manifest_digest)
     }
 
+    /// Live probe of the token-challenge flow against ghcr: anonymous
+    /// pull of the v0.1.0 x86_64 artifact, verified against its signed
+    /// pin, then downloaded into a layout and verified again as local
+    /// bytes (the client's real install path: flatpak's docker://
+    /// fetch cannot authenticate, so it installs from this layout).
+    /// Ignored by default (network, and the digest is release
+    /// specific); run with `--ignored` when touching registry code.
+    #[test]
+    #[ignore]
+    fn verifies_ghcr_through_the_token_challenge() {
+        let location =
+            Location::parse("docker://ghcr.io/letdown2491/orchard").unwrap();
+        let pin = "sha256:151fce148d463871c07a28342dc9064c6e52ce0cc5a20ecca99311811888753f";
+        let report = verify(&location, Some(pin)).unwrap();
+        assert_eq!(
+            report.flatpak_ref.as_deref(),
+            Some("app/rocks.orchard.Orchard/x86_64/stable")
+        );
+
+        // the download path: a fresh layout, verified as local bytes
+        let dest = unique_dir("ghcr-download");
+        let digest = download_layout(&location, Some(pin), &dest).unwrap();
+        assert_eq!(digest, pin);
+        assert!(dest.join("index.json").is_file(), "index.json written");
+        assert!(dest.join("oci-layout").is_file(), "oci-layout written");
+        let report = verify(&Location::OciDir(dest.clone()), Some(pin)).unwrap();
+        assert_eq!(
+            report.flatpak_ref.as_deref(),
+            Some("app/rocks.orchard.Orchard/x86_64/stable")
+        );
+        std::fs::remove_dir_all(&dest).unwrap();
+    }
+
+    #[test]
+    fn refuses_to_download_a_local_layout() {
+        let (dir, _digest) = make_layout("no-download");
+        let dest = unique_dir("no-download-dest");
+        let err = download_layout(&Location::OciDir(dir.clone()), None, &dest)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(err.contains("already a local layout"), "{err}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn verifies_local_layout_and_reads_labels() {
         let (dir, digest) = make_layout("verify");
@@ -547,6 +899,34 @@ mod tests {
         std::fs::write(&path, &bytes).unwrap();
         assert!(verify(&Location::OciDir(dir.clone()), None).is_err());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn reads_ghcr_style_challenge() {
+        let challenge = "Bearer realm=\"https://ghcr.io/token\",service=\"ghcr.io\",scope=\"repository:letdown2491/orchard:pull\"";
+        let (realm, url) =
+            token_endpoint(challenge, "letdown2491/orchard", "orchard/test").unwrap();
+        assert_eq!(realm, "https://ghcr.io/token");
+        // the challenge's own scope wins; client id rides along
+        assert!(url.contains("service=ghcr.io"), "{url}");
+        assert!(
+            url.contains("scope=repository%3Aletdown2491%2Forchard%3Apull"),
+            "{url}"
+        );
+        assert!(url.contains("client_id=orchard%2Ftest"), "{url}");
+
+        // no scope in the challenge: the repository-derived fallback
+        let (realm, url) = token_endpoint(
+            "Bearer realm=\"https://auth.docker.io/token\",service=\"registry.docker.io\"",
+            "owner/repo",
+            "orchard/test",
+        )
+        .unwrap();
+        assert_eq!(realm, "https://auth.docker.io/token");
+        assert!(url.contains("scope=repository%3Aowner%2Frepo%3Apull"), "{url}");
+
+        // a challenge without a realm is a hard error
+        assert!(token_endpoint("Bearer service=\"x\"", "owner/repo", "c").is_err());
     }
 
     #[test]
@@ -630,7 +1010,4 @@ mod tests {
             "https://localhost:5000"
         );
     }
-
-    /// A realistic pinned digest for location parsing tests.
-    const DIGEST_PIN: &str = "sha256:09cd4430de03980c9c2c599fb36b9ea9786c92bfe406a311426dbf6b80c0223c";
 }

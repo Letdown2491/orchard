@@ -2112,7 +2112,8 @@ impl StoreRoot {
                 return;
             }
         };
-        let install_arg = location.install_arg();
+        // the registry details ride along for the artifact download
+        let download_source = location.clone();
         // the status line's "from": the registry host the parsed
         // location carries, or nothing for a local layout
         let place = match &location {
@@ -2134,6 +2135,45 @@ impl StoreRoot {
                 .background_executor()
                 .spawn(async move { oci::verify(&location, pinned.as_deref()) })
                 .await;
+            // The registry fetch and the install handoff: flatpak's
+            // docker:// image path never authenticates (it fetches
+            // bare, so token registries like ghcr answer 401), so the
+            // client itself downloads the verified artifact into a
+            // local OCI layout and hands flatpak that: the zero-setup
+            // oci: path. Layouts are content-addressed by manifest
+            // digest and land by rename, so an existing directory is
+            // a complete one and a retry skips the download.
+            let install_arg = match (&report, &download_source) {
+                (Ok(report), oci::Location::Registry { .. }) => {
+                    let dir = crate::cache::artifact_dir(&app.app_id, &report.digest);
+                    if dir.is_dir() {
+                        format!("oci:{}", dir.display())
+                    } else {
+                        let source = download_source.clone();
+                        let dir_arg = dir.clone();
+                        let digest = report.digest.clone();
+                        let downloaded = cx
+                            .background_executor()
+                            .spawn(async move {
+                                oci::download_layout(&source, Some(&digest), &dir_arg)
+                            })
+                            .await;
+                        if let Err(err) = downloaded {
+                            let _ = this.update(cx, |this, cx| {
+                                this.jobs.remove(&app.app_id);
+                                this.fail(format!("download failed for {}: {err:#}", app.name));
+                                cx.notify();
+                            });
+                            return;
+                        }
+                        format!("oci:{}", dir.display())
+                    }
+                }
+                (Ok(_), oci::Location::OciDir(path)) => format!("oci:{}", path.display()),
+                // verify failed: the update below reports it and never
+                // reaches an install
+                (Err(_), _) => String::new(),
+            };
             let verified = report.map(|report| {
                 (
                     report.flatpak_ref.clone(),
@@ -2144,8 +2184,8 @@ impl StoreRoot {
             let _ = this.update(cx, |this, cx| {
                 match verified {
                     Ok((flatpak_ref, digest, metadata)) => {
-                        // a cancel pressed during the verify: the
-                        // receipt, no install
+                        // a cancel pressed during the verify or the
+                        // download: the receipt, no install
                         if this
                             .jobs
                             .get(&app.app_id)

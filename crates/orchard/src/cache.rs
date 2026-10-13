@@ -142,6 +142,24 @@ pub fn image_cache_bytes() -> u64 {
     dir_bytes(&root())
 }
 
+/// Where a verified registry artifact lands as a local OCI layout for
+/// flatpak to install from: one directory per app id and manifest
+/// digest, under the cache root. Cache semantics on purpose: the
+/// layout is rebuildable bytes, and the client re-downloads when it
+/// is absent. Only the parent chain is created here; the layout
+/// directory itself appears by rename when a download completes, so
+/// an existing directory is always a complete one.
+pub fn artifact_dir(app_id: &str, digest: &str) -> PathBuf {
+    let dir = root()
+        .join("artifacts")
+        .join(app_id)
+        .join(digest.trim_start_matches("sha256:"));
+    if let Some(parent) = dir.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    dir
+}
+
 /// Delete every cached image. The directory is rebuilt lazily on the
 /// next fetch; pairing QR files share the dir and are transient by
 /// design, so clearing them costs nothing.
