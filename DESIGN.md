@@ -214,11 +214,20 @@ and kumaui use:
 ```
 
 The script builds `localhost/orchard-dev-rust` on first use from
-`containers/orchard-dev-rust.containerfile` (based on kuma's `kuma-dev-gcc`, which tracks
-the release's Fedora; the gpui native stack lives here), keeps rustup and the cargo
+`containers/orchard-dev-rust.containerfile` (Fedora plus the gpui native
+stack), keeps rustup and the cargo
 registry in named volumes for incremental builds, and pins the toolchain via
 `rust-toolchain.toml`. Run the built binary on the host, not in the container: the GPUI
 shell needs the host's Wayland session.
+
+**The container's Fedora is a hard pin (decided 2026-10-13):** the published
+flatpak app runs against its runtime's glibc (freedesktop 25.08 carries 2.42),
+and a binary built on a newer Fedora dies inside the sandbox with
+"`GLIBC_2.4x not found`", which is exactly what the first v0.1.0 install did.
+The container builds on Fedora 43 (glibc 2.42); its binary also runs on the
+newer host, since glibc is backwards compatible. Bump the container pin with
+the runtime the publish manifest targets, and after bumping wipe
+`target/release` (cargo's fingerprints cannot see a container change).
 
 ## Milestones
 
@@ -469,7 +478,10 @@ opening items because they need the push, the signing secret, and a tag.
       (Secrets and ghcr work on the private repo too; the repository proof only
       verifies once the repo is public, since the raw URL of a private repo does
       not resolve. The workflow holds `contents: write` so CI's `--prove` can
-      refresh the proof file.)
+      refresh the proof file.) Progress 2026-10-13: `v0.1.0` tagged and
+      self-published, the ghcr pull works anonymously, and the relay carries the
+      listing; what remains is the GUI install and the update handoff, which
+      v0.1.1 (the glibc and fetch fixes) is positioned to deliver.
 - [x] The bootstrap story is curl plus one flatpak command, pinned by
       digest: every Orchard user has flatpak as a runtime prerequisite
       anyway, and the self-publish artifact is already a flatpak OCI
@@ -483,9 +495,10 @@ opening items because they need the push, the signing secret, and a tag.
       bootstrap the client is the install path anyway.) A deb is the
       later, non-technical path (step zero only; updates come
       through the catalog); a GitHub tarball is the optional fallback for
-      flatpak-ancient hosts. Flip-day test: the exact command on a
+      flatpak-ancient hosts. Flip-day test: the exact commands on a
       machine that never ran Orchard, and the update handoff when
-      Orchard's own installer re-installs the ref the one-liner deployed.
+      Orchard's own installer re-installs the ref the bootstrap
+      deployed.
 - [x] Avatars: kind 0 `picture` in the account trigger and review rows via the
       image cache; person glyph as fallback. (Built: profiles fetched and parsed
       once per refresh; avatars are round `img` crops, the glyph stands in until

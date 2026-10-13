@@ -38,15 +38,15 @@ client, not a gatekeeper.
 
 Early, pre-release MVP. The full loop works end to end against local
 infrastructure: publish, discover, verify, install, update, review.
-Multi-arch (x86_64 and aarch64) is built and the first public release
-lands with the `v0.1.0` tag (tag and push it; CI does the rest, then
-flip the ghcr package public). `DESIGN.md` is the architecture record
+Multi-arch (x86_64 and aarch64) builds in CI, and the first public
+release shipped with the `v0.1.0` tag (self-published through this
+repo's own workflow). `DESIGN.md` is the architecture record
 with the milestone history.
 
 ## Install
 
-Once the `v0.1.0` release exists, the whole app is one flatpak command
-away, two commands, pinned to the exact bytes the release signed:
+The release is two commands away, pinned to the exact bytes it
+signed:
 
     curl -LO https://github.com/Letdown2491/orchard/releases/latest/download/orchard-linux-x86_64.oci.tgz
     flatpak install --user -y oci-archive:orchard-linux-x86_64.oci.tgz

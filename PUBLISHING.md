@@ -134,7 +134,10 @@ Field notes:
 
 1. **Builds the artifact** deterministically from the tree: sorted layer
    entries, mtime zero, so the same tree always produces the same manifest
-   digest.
+   digest. The layer gains a generated appstream snippet
+   (`files/share/app-info/xmls/<app-id>.xml.gz`, one release entry with
+   this build's version): it is the only thing `flatpak list` reads its
+   version column from.
 2. **Pushes and reads back.** Monolithic blob upload plus manifest PUT,
    then a fetch of the manifest *by digest*. The signed events only go out
    if the registry serves exactly the bytes that were built.
@@ -261,7 +264,21 @@ jobs:
           target/release/orchard-publish your.publish.toml \
             --arch "${{ matrix.arch }}" \
             --registry "ghcr.io/${GITHUB_REPOSITORY,,}" \
+            --tag "latest-${{ matrix.arch }}" \
             --prove
+
+      - name: Attach the artifact to the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # flatpak's docker:// image fetch never authenticates, and
+          # token registries (ghcr) always challenge, so the release
+          # carries the artifact itself: your users' bootstrap is a
+          # curl plus `flatpak install --user oci-archive:`
+          tar -C "target/publish/your.app.Id" -czf "your-app-${{ matrix.arch }}.oci.tgz" .
+          gh release create "$GITHUB_REF_NAME" --generate-notes || true
+          gh release upload "$GITHUB_REF_NAME" \
+            "your-app-${{ matrix.arch }}.oci.tgz" --clobber
 ```
 
 Notes:
@@ -271,6 +288,12 @@ Notes:
   bearer-token challenge; other registries use their own credentials.
 - `ORCHARD_PUBLISH_VERSION` overrides the manifest's version, so one
   manifest serves every future tag.
+- `--tag latest-<arch>` keeps the matrix legs off one tag. The tag is
+  a handle for humans and container tools; the client installs by the
+  digest the event carries.
+- Attach the artifact to the release (the step above): it is the only
+  flatpak-reachable copy, because flatpak's docker:// fetch cannot
+  authenticate.
 - `contents: write` matters: `--prove` refreshes `orchard.txt` on the
   default branch through the `GITHUB_TOKEN`, and a read-only token
   fails that write after the artifact and events are already out.

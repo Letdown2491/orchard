@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Builds Orchard inside a container (the host is atomic: no toolchain).
-# Derives localhost/orchard-dev-rust from kuma's kuma-dev-gcc on first
+# Builds localhost/orchard-dev-rust from the containerfile on first
 # use; rustup and the cargo registry live in named volumes so later
 # builds are incremental.
 #
