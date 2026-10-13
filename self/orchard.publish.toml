@@ -17,7 +17,7 @@ repository = "https://github.com/Letdown2491/orchard"
 icon = "https://raw.githubusercontent.com/Letdown2491/orchard/main/assets/orchard-512.png"
 
 [release]
-version = "0.1.0"
+version = "0.1.1"
 arch = "linux-x86_64"
 # the full coverage both CI legs build; every leg publishes the same
 # listing, and each host picks the artifact built for it

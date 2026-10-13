@@ -63,4 +63,20 @@ jobs:
           target/release/orchard-publish self/orchard.publish.toml \
             --arch "${{ matrix.arch }}" \
             --registry "ghcr.io/${GITHUB_REPOSITORY,,}" \
+            --tag "latest-${{ matrix.arch }}" \
             --prove
+
+      - name: Attach the artifact to the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # The digest-pinned docker:// one-liner cannot work against
+          # ghcr: flatpak's image fetch never authenticates (it does
+          # not even try a token on a 401). The release therefore
+          # carries the artifact itself, as an oci-archive the README's
+          # two-liner installs with flatpak's local path.
+          tar -C "target/publish/rocks.orchard.Orchard" \
+            -czf "orchard-${{ matrix.arch }}.oci.tgz" .
+          gh release create "$GITHUB_REF_NAME" --generate-notes || true
+          gh release upload "$GITHUB_REF_NAME" \
+            "orchard-${{ matrix.arch }}.oci.tgz" --clobber

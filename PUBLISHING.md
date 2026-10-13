@@ -153,6 +153,7 @@ carried one affects availability only.
 | Flag | Meaning |
 |---|---|
 | `--registry host/repo` | push target; without it the artifact stays a local OCI layout |
+| `--tag tag` | push tag override (the manifest's `[publish] tag` by default). The event's location carries the digest, so this never decides what a client installs; CI pushes `latest-<arch>` so matrix legs don't share a tag |
 | `--relays url,url` | override the manifest's relay list for this run; also bypasses the required-relay check |
 | `--nsec <key>` | signing key (hex or nsec); `ORCHARD_NSEC` env also works |
 | `--arch linux-aarch64` | build and sign for this arch (CI matrix legs) |

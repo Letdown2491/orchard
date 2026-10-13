@@ -78,7 +78,10 @@ pub fn write_proof(repo: &str, pubkey_npub: &str, token: &str) -> Result<()> {
         .send_json(body)
         .map_err(|err| anyhow!("writing the proof file: {err}"))
         .with_context(|| format!("into {repo}"))?;
-    if response.status() != 200 {
+    // 200 is an update of the existing file, 201 Created its first
+    // write (the matrix leg that runs first creates it): both are
+    // success. Anything else is a denial.
+    if !matches!(response.status(), 200 | 201) {
         bail!("the forge answered {} writing the proof file", response.status());
     }
     Ok(())

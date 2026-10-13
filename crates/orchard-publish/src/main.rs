@@ -33,6 +33,12 @@ fn main() {
 struct Args {
     manifest_path: PathBuf,
     registry: Option<String>,
+    /// Override the manifest's push tag: CI's matrix pushes one image
+    /// per arch, and two legs writing one tag would flap `latest`
+    /// between architectures. The event's location carries the digest
+    /// form, so this tag never decides what a client installs; it is
+    /// a stable handle for humans and container tools.
+    tag: Option<String>,
     relays: Option<Vec<String>>,
     nsec: Option<String>,
     out: Option<PathBuf>,
@@ -49,6 +55,7 @@ fn parse_args() -> Result<Args> {
     let mut values = std::env::args().skip(1);
     let mut manifest_path = None;
     let mut registry = None;
+    let mut tag = None;
     let mut relays = None;
     let mut nsec = std::env::var("ORCHARD_NSEC").ok();
     let mut out = None;
@@ -62,6 +69,7 @@ fn parse_args() -> Result<Args> {
         };
         match flag.as_str() {
             "--registry" => registry = Some(next()?),
+            "--tag" => tag = Some(next()?),
             "--relays" => {
                 relays = Some(
                     next()?
@@ -88,8 +96,9 @@ fn parse_args() -> Result<Args> {
         }
     }
     Ok(Args {
-        manifest_path: manifest_path.ok_or_else(|| anyhow::anyhow!("usage: orchard-publish <manifest.toml> [--registry registry/repo] [--relays urls]"))?,
+        manifest_path: manifest_path.ok_or_else(|| anyhow::anyhow!("usage: orchard-publish <manifest.toml> [--registry registry/repo] [--tag tag] [--relays urls]"))?,
         registry,
+        tag,
         relays,
         nsec,
         out,
@@ -188,21 +197,27 @@ fn run() -> Result<()> {
         built.manifest_digest
     );
 
-    // push: the event pins the digest the registry serves, which the
-    // client later verifies before install
+    // push: the location carries the digest form, so the client's
+    // verify and install both fetch the exact bytes this run built;
+    // the tag is a per-arch handle for humans and container tools
     let location = match (&args.registry, args.skip_push) {
         (Some(registry_repo), false) => {
-            let tag = manifest
-                .publish
-                .as_ref()
-                .map(|p| p.tag.as_str())
+            let tag = args
+                .tag
+                .as_deref()
+                .or_else(|| {
+                    manifest
+                        .publish
+                        .as_ref()
+                        .map(|p| p.tag.as_str())
+                })
                 .unwrap_or("latest");
             let digest = push::push_layout(registry_repo, tag, &built.layout)?;
             if digest != built.manifest_digest {
                 bail!("registry serves {digest}, built {built_digest}", built_digest = built.manifest_digest);
             }
             println!("pushed as {registry_repo}:{tag}");
-            format!("docker://{registry_repo}")
+            format!("docker://{registry_repo}@{digest}")
         }
         _ => format!("oci:{}", built.layout.display()),
     };
