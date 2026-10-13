@@ -53,7 +53,7 @@ pub fn build(
     let metadata_ini = String::from_utf8(metadata_bytes.clone())
         .with_context(|| "metadata ini is not utf-8")?;
 
-    let tar_bytes = build_layer_tar(tree)?;
+    let tar_bytes = build_layer_tar(tree, app_id, version)?;
     let gz_bytes = gzip(&tar_bytes)?;
     let layer_digest = sha256_digest(&gz_bytes);
     let diff_id = sha256_digest(&tar_bytes);
@@ -142,11 +142,55 @@ pub fn build(
 
 /// Tar the app tree deterministically: sorted entries, mtime 0, uid/gid
 /// 0, no user/group names, exec bit preserved.
-fn build_layer_tar(tree: &Path) -> Result<Vec<u8>> {
+fn build_layer_tar(tree: &Path, app_id: &str, version: &str) -> Result<Vec<u8>> {
     let mut builder = tar::Builder::new(Vec::new());
     for entry in sorted_children(tree)? {
         add_path(&mut builder, &entry, &entry.file_name().unwrap().to_string_lossy())?;
     }
+    // The appstream snippet: `flatpak list` reads the version column
+    // from files/share/app-info/xmls/<app-id>.xml.gz in the deployed
+    // tree, and nothing else (the OCI labels do not reach it). One
+    // component, one release entry. The timestamp is 1, not a build
+    // date: it only has to beat the parser's initial 0 (with one
+    // entry there is nothing newer to lose to), and a build date
+    // would break the build's determinism, which re-runs of a tag
+    // rely on.
+    let appdata = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <components>\n\
+         \x20 <component type=\"desktop\">\n\
+         \x20   <id>{app_id}</id>\n\
+         \x20   <name>{app_id}</name>\n\
+         \x20   <releases>\n\
+         \x20     <release version=\"{version}\" timestamp=\"1\"/>\n\
+         \x20   </releases>\n\
+         \x20 </component>\n\
+         </components>\n"
+    );
+    for dir in [
+        "files",
+        "files/share",
+        "files/share/app-info",
+        "files/share/app-info/xmls",
+    ] {
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Directory);
+        header.set_mode(0o755);
+        header.set_size(0);
+        header.set_mtime(0);
+        builder.append_data(&mut header, dir, std::io::empty())?;
+    }
+    let mut header = tar::Header::new_gnu();
+    header.set_entry_type(tar::EntryType::Regular);
+    header.set_mode(0o644);
+    header.set_mtime(0);
+    let xml_gz = gzip(appdata.as_bytes())?;
+    header.set_size(xml_gz.len() as u64);
+    builder.append_data(
+        &mut header,
+        &format!("files/share/app-info/xmls/{app_id}.xml.gz"),
+        xml_gz.as_slice(),
+    )?;
     builder.finish()?;
     Ok(builder.into_inner()?)
 }
