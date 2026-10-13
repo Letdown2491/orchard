@@ -31,7 +31,7 @@ import tarfile
 import time
 from pathlib import Path
 
-APP_ID = "com.orchard.Hello"
+APP_ID = "rocks.orchard.Hello"
 REF = f"app/{APP_ID}/x86_64/stable"
 VERSION = "1.0.0"
 
