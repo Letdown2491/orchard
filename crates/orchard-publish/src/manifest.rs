@@ -30,7 +30,7 @@ pub struct AppMeta {
     pub categories: Vec<String>,
     pub license: Option<String>,
     pub repository: Option<String>,
-    /// The project's homepage, published as the `h` tag.
+    /// The project's homepage, published as the `url` tag.
     pub homepage: Option<String>,
 }
 
@@ -51,9 +51,6 @@ pub struct ReleaseMeta {
     #[serde(default)]
     pub platforms: Vec<String>,
     pub notes: Option<String>,
-    /// Runtime requirement recorded on the asset event, e.g.
-    /// `org.freedesktop.Platform/x86_64/25.08`.
-    pub runtime: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -104,21 +101,6 @@ impl Manifest {
         }
     }
 
-    /// The runtime requirement for this build's arch: a runtime ref
-    /// is `<id>/<arch>/<branch>` and the arch segment follows the
-    /// build, so one TOML serves every CI leg. A runtime that is not
-    /// three segments passes through untouched.
-    pub fn runtime_for_build(&self) -> Option<String> {
-        self.release.runtime.as_ref().map(|runtime| {
-            let mut pieces: Vec<String> =
-                runtime.split('/').map(str::to_string).collect();
-            if pieces.len() == 3 {
-                pieces[1] = self.ref_arch();
-            }
-            pieces.join("/")
-        })
-    }
-
     /// Flatpak ref architecture (`linux-x86_64` to `x86_64`).
     pub fn ref_arch(&self) -> String {
         self.release
@@ -154,13 +136,6 @@ pub fn load(path: &Path) -> Result<Manifest> {
         );
     }
     manifest.artifact.tree = base.join(&manifest.artifact.tree);
-    let tree = &manifest.artifact.tree;
-    if !tree.join("metadata").is_file() {
-        bail!(
-            "artifact tree {} has no metadata ini: the sandbox ini is the source of truth",
-            tree.display()
-        );
-    }
     Ok(manifest)
 }
 
@@ -206,7 +181,7 @@ tree = "tree"
     }
 
     #[test]
-    fn rejects_tree_without_metadata() {
+    fn publication_manifest_does_not_require_the_build_tree() {
         let dir = std::env::temp_dir().join(format!("orchard-manifest-bad-{}", std::process::id()));
         std::fs::create_dir_all(dir.join("tree")).unwrap();
         let path = dir.join("app.toml");
@@ -226,7 +201,7 @@ tree = "tree"
 "#,
         )
         .unwrap();
-        assert!(load(&path).is_err());
+        assert!(load(&path).is_ok());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

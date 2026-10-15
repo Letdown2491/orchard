@@ -6,6 +6,7 @@
 //! ([`permissions`]).
 
 pub mod appstream;
+pub mod oci_asset;
 pub mod model;
 pub mod oci;
 pub mod permissions;

@@ -1,11 +1,5 @@
-# Orchard publishing itself: the same path every publisher uses,
-# run on our own artifact. CI runs this on a version tag with
-# ORCHARD_NSEC as the only secret; a local run against the demo
-# registry is the dry run, with --relays overriding the public
-# relays below (you never want a test publish landing on them).
-#
-#   ORCHARD_NSEC=<key> orchard-publish self/orchard.publish.toml \
-#     --registry ghcr.io/letdown2491/orchard
+# CI prepares one layout per architecture and publishes one combined release.
+# Publication uses the public relays below; --relays overrides for local tests.
 
 [app]
 id = "rocks.orchard.Orchard"
@@ -19,10 +13,8 @@ icon = "https://raw.githubusercontent.com/Letdown2491/orchard/main/assets/orchar
 [release]
 version = "0.2.0"
 arch = "linux-x86_64"
-# the full coverage both CI legs build; every leg publishes the same
-# listing, and each host picks the artifact built for it
+# Every declared platform must be present in the combined release.
 platforms = ["linux-x86_64", "linux-aarch64"]
-runtime = "org.freedesktop.Platform/x86_64/25.08"
 notes = "Zapstore-published flatpak releases now install and update from Orchard; image updates uninstall first, then install (the running app keeps working, user data is kept); bundle artifacts update in place; the Sources settings section is now Catalog, holding only Opens on; the artifact cache keeps only the newest layout per app. Coming from 0.1.2 or 0.1.4: uninstall and reinstall once, the old client cannot perform this update."
 
 [artifact]

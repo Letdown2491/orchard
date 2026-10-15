@@ -102,8 +102,9 @@ Orchard publishes itself. `self/orchard.publish.toml` is the manifest,
 `self/tree/` is the app tree (its `assemble.sh` drops the built binary
 into `files/bin`; the metadata, desktop file, and launcher icon are
 committed beside it), and `self-publish.yml` is the workflow that ties
-it together. The dry run is the same manifest against the local
-registry and relay; the real run is the version tag, and nothing else.
+it together. Architecture jobs push to GHCR and export asset metadata; one job
+publishes a combined release. The version tag triggers it.
+
 
 **Never run orchard-publish on `self/orchard.publish.toml` bare**: the
 manifest's relay list is the public rendezvous set, so a bare run is a
