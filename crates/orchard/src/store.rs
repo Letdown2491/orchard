@@ -1256,6 +1256,8 @@ impl StoreRoot {
                 return;
             }
         };
+        let assets = self.apps.iter().find(|app| app.app_id == app_id && app.publisher == publisher)
+            .and_then(|app| app.oci_assets.clone());
         let cache_key = pinned
             .as_deref()
             .map(|pin| digest_cache_key(location_text.as_deref().unwrap_or(""), pin));
@@ -1268,7 +1270,7 @@ impl StoreRoot {
             // twice, so an uncached bundle records no verdict and no
             // error and the page keeps its neutral note.
             let bundle = match (&location, pinned.as_deref()) {
-                (oci::Location::Https { url }, Some(pin)) => Some((
+                (oci::Location::Https { url }, Some(pin)) if assets.is_none() => Some((
                     url.clone(),
                     crate::cache::artifact_file(&app_id, pin),
                 )),
@@ -1289,7 +1291,7 @@ impl StoreRoot {
                 }
                 None => cx
                     .background_executor()
-                    .spawn(async move { oci::verify(&location, pinned.as_deref()) })
+                    .spawn(async move { oci::verify_with_assets(&location, pinned.as_deref(), assets.as_deref()) })
                     .await,
             };
             let _ = this.update(cx, |this, cx| {
@@ -2312,6 +2314,7 @@ impl StoreRoot {
                 .unwrap_or_default()
                 .to_string(),
             oci::Location::OciDir(_) => String::new(),
+            oci::Location::ManifestUrl(url) => url.clone(),
         };
         self.jobs
             .insert(app.app_id.clone(), Job::new(JobState::Verifying));
@@ -2320,7 +2323,8 @@ impl StoreRoot {
         cx.spawn(async move |this, cx| {
             let pinned = app.pinned_digest.clone();
             let mut app = app;
-            let report = if matches!(location, oci::Location::Https { .. }) {
+            let assets = app.oci_assets.clone();
+            let report = if assets.is_none() && matches!(location, oci::Location::Https { .. }) {
                 let app_id = app.app_id.clone();
                 cx.background_executor()
                     .spawn(async move {
@@ -2344,7 +2348,7 @@ impl StoreRoot {
                     .await
             } else {
                 cx.background_executor()
-                    .spawn(async move { oci::verify(&location, pinned.as_deref()) })
+                    .spawn(async move { oci::verify_with_assets(&location, pinned.as_deref(), assets.as_deref()) })
                     .await
             };
 
@@ -2477,7 +2481,8 @@ impl StoreRoot {
             // digest and land by rename, so an existing directory is
             // a complete one and a retry skips the download.
             let install_arg = match (&report, &download_source) {
-                (Ok(report), oci::Location::Registry { .. }) => {
+                (Ok(report), source) if app.oci_assets.is_some()
+                    || matches!(source, oci::Location::Registry { .. } | oci::Location::ManifestUrl(_)) => {
                     let dir = crate::cache::artifact_dir(&app.app_id, &report.digest);
                     if dir.is_dir() {
                         format!("oci:{}", dir.display())
@@ -2485,10 +2490,11 @@ impl StoreRoot {
                         let source = download_source.clone();
                         let dir_arg = dir.clone();
                         let digest = report.digest.clone();
+                        let assets = app.oci_assets.clone();
                         let downloaded = cx
                             .background_executor()
                             .spawn(async move {
-                                oci::download_layout(&source, Some(&digest), &dir_arg)
+                                oci::download_layout_with_assets(&source, Some(&digest), &dir_arg, assets.as_deref())
                             })
                             .await;
                         if let Err(err) = downloaded {
@@ -2514,6 +2520,7 @@ impl StoreRoot {
                 // verify failed: the update below reports it and never
                 // reaches an install
                 (Err(_), _) => String::new(),
+                (Ok(_), oci::Location::Registry { .. } | oci::Location::ManifestUrl(_)) => unreachable!(),
             };
             let verified = report.map(|report| {
                 (
@@ -2549,13 +2556,19 @@ impl StoreRoot {
                         }
                         // The catalog ref must match what the image labels
                         // claim; flatpak enforces this again at pull time.
-                        let _ = flatpak_ref;
+                        let expected_ref = format!("app/{}/{}/stable", app.app_id, orchard_core::host_ref_arch());
+                        if flatpak_ref.as_deref() != Some(expected_ref.as_str()) {
+                            this.jobs.remove(&app.app_id);
+                            this.fail(format!("artifact does not contain {expected_ref}"));
+                            cx.notify();
+                            return;
+                        }
                         // a bundle artifact installs with --bundle and
                         // updates in place (no uninstall step: proven
                         // bundle-over-bundle); an image artifact needs
                         // the uninstall-then-install chain when updating
                         let is_bundle =
-                            matches!(download_source, oci::Location::Https { .. });
+                            app.oci_assets.is_none() && matches!(download_source, oci::Location::Https { .. });
                         let app_cmd = |no_deps: bool| {
                             if is_bundle {
                                 orchard_flatpak::install_bundle(
@@ -8212,6 +8225,8 @@ fn orchard_fingerprint<'a>(rows: impl IntoIterator<Item = &'a StoreApp>) -> Stri
             app.summary,
             app.successor_to.as_deref().unwrap_or(""),
         );
+        // A new release may relocate blobs without changing the image hash.
+        let _ = writeln!(fingerprint, "{:?}{:?}", app.location, app.oci_assets);
     }
     fingerprint
 }
@@ -9522,6 +9537,7 @@ mod tests {
             flatpak_ref: "app/com.example.Hello/x86_64/stable".into(),
             location: "oci:/srv/hello".into(),
             digest: Some("sha256:aa".into()),
+            oci_assets: None,
             metadata: None,
             repository: None,
             homepage: None,
@@ -9636,6 +9652,7 @@ mod tests {
             flatpak_ref: "app/com.example.Hello/x86_64/stable".into(),
             location: "oci:/srv/hello".into(),
             digest: Some("sha256:aa".into()),
+            oci_assets: None,
             metadata: None,
             repository: None,
             homepage: None,
@@ -9649,6 +9666,14 @@ mod tests {
         let mut updated = app.clone();
         updated.version = Some("1.1.0".into());
         assert_ne!(same, orchard_fingerprint(std::slice::from_ref(&updated)));
+        let mut relocated = app.clone();
+        relocated.oci_assets = Some(vec![orchard_core::oci_asset::BlobAsset {
+            sha256: "a".repeat(64), url: "https://first.example/blob".into(),
+            mime: "application/vnd.oci.image.config.v1+json".into(), size: 42,
+        }]);
+        let old = orchard_fingerprint(std::slice::from_ref(&relocated));
+        relocated.oci_assets.as_mut().unwrap()[0].url = "https://second.example/blob".into();
+        assert_ne!(old, orchard_fingerprint(std::slice::from_ref(&relocated)));
         // so does a listing edit
         app.summary = "Edited summary".into();
         assert_ne!(same, orchard_fingerprint(std::slice::from_ref(&app)));

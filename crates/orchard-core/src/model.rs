@@ -189,11 +189,14 @@ pub struct CatalogApp {
     pub platforms: Vec<String>,
     /// Full flatpak ref, e.g. `app/com.example.Hello/x86_64/stable`.
     pub flatpak_ref: String,
-    /// Artifact location: `oci:<dir>` or `docker://<registry>/<repo>:<tag>`.
+    /// Artifact location: an HTTP(S) manifest URL, local OCI layout, or registry reference.
     pub location: String,
-    /// Pinned manifest digest, `sha256:…`. Installs refuse to run on mismatch.
+    /// Pinned manifest digest, `sha256:…`.
     #[serde(default)]
     pub digest: Option<String>,
+    /// Config/layer assets referenced by this release; None is a legacy artifact.
+    #[serde(default)]
+    pub oci_assets: Option<Vec<crate::oci_asset::BlobAsset>>,
     /// The project's source repository, the listing's `repository` tag.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repository: Option<String>,
@@ -263,6 +266,7 @@ pub struct StoreApp {
     pub location: Option<String>,
     /// Pinned digest (publisher channel only).
     pub pinned_digest: Option<String>,
+    pub oci_assets: Option<Vec<crate::oci_asset::BlobAsset>>,
     /// The previous publisher key that designated this row's
     /// publisher (publisher channel only).
     pub successor_to: Option<String>,
@@ -294,6 +298,7 @@ impl StoreApp {
             metadata: None,
             location: None,
             pinned_digest: None,
+            oci_assets: None,
             successor_to: None,
             platforms: Vec::new(),
         }
@@ -326,6 +331,7 @@ impl StoreApp {
             metadata: app.metadata.clone(),
             location: Some(app.location.clone()),
             pinned_digest: app.digest.clone(),
+            oci_assets: app.oci_assets.clone(),
             successor_to: app.successor_to.clone(),
             platforms: app.platforms.clone(),
         }

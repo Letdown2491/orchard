@@ -1,7 +1,7 @@
 //! NIP-82 software events for Orchard.
 //!
 //! Orchard consumes the NIP-82 draft event kinds: the same ones Zapstore's
-//! `zsp` publishes, so publishers are cross-compatible:
+//! `zsp` publishes. Installation selects supported Flatpak OCI manifests:
 //!
 //! | kind  | role              | `d` tag              |
 //! |-------|-------------------|----------------------|
@@ -10,11 +10,10 @@
 //! | 30063 | release           | `<app-id>@<version>` |
 //! | 3063  | asset             | (none)               |
 //!
-//! Orchard's additive tags: `f` carries flatpak arches (`linux-x86_64`,
-//! `linux-aarch64`), and the asset carries `oci` (artifact location) and
-//! `runtime` (flatpak runtime requirement). Sandbox permissions are never in
-//! events: the artifact's commit metadata (`xa.metadata`) is the single
-//! source of truth, pinned by the asset's sha256.
+//! Assets use `f` for platform and the `T=flatpak-oci`
+//! convention for the software target. Standard `url`, `m`, `size` and `x` describe
+//! the manifest file. Permissions and runtime requirements live in the
+//! verified OCI content, not in unsigned catalog claims.
 //!
 //! Everything here is offline: events arrive as signed NIP-01 JSON, are
 //! verified (id hash + Schnorr signature), accumulated, and projected into
@@ -100,12 +99,12 @@ impl Parts {
             .filter(|value| !value.is_empty())
     }
 
-    /// Every value of the named tag (row's second element onward).
+    /// The value of each named tag. Later elements are hints, not values.
     fn tag_values(&self, name: &str) -> Vec<String> {
         self.tags
             .iter()
             .filter(|row| row.first().is_some_and(|key| key == name))
-            .flat_map(|row| row.iter().skip(1).cloned())
+            .filter_map(|row| row.get(1).cloned())
             .filter(|value| !value.is_empty())
             .collect()
     }
@@ -153,20 +152,19 @@ struct Release {
     asset_refs: Vec<String>,
 }
 
-/// One asset (kind 3063): the artifact pin. `x` is the sha256 of the
-/// artifact; `oci` carries the location; `runtime` the flatpak runtime
-/// requirement. Assets are unique by event id (no `d` tag).
+/// One asset (kind 3063). Standard Flatpak manifest assets use `url` and
+/// pin manifest bytes with `x`; existing OCI references pin their manifest.
+/// Assets are unique by event id (no `d` tag).
 struct Asset {
     event: Event,
     created_at: u64,
-    /// The signer's hex key, kept at absorb (same reason as the
-    /// release's).
+    /// The asset signer, cached for catalog projection.
     publisher: String,
-    /// The platform this artifact was built for, from the `f` tag.
-    /// None: a legacy asset from before the tag existed.
-    platform: Option<String>,
+    /// Supported platforms, one per f tag.
+    platforms: Vec<String>,
     digest: Option<String>,
     location: Option<String>,
+    blob: Option<orchard_core::oci_asset::BlobAsset>,
     // the runtime requirement and asset version surface on the app page
     #[allow(dead_code)]
     runtime: Option<String>,
@@ -189,6 +187,9 @@ impl Asset {
     /// the linux platform tags, so the kind, not just the platform,
     /// decides installability.
     fn installable_kind(&self) -> bool {
+        if let Some(blob) = &self.blob {
+            return blob.mime == orchard_core::oci_asset::MIME;
+        }
         match self.location.as_deref() {
             Some(loc) if loc.starts_with("oci:") || loc.starts_with("docker://") => true,
             _ => {
@@ -482,7 +483,8 @@ impl Feed {
                 categories: parts.tag_values("t"),
                 platforms,
                 repository: parts.tag("repository"),
-                homepage: parts.tag("h"),
+                homepage: parts.tag("url").or_else(|| parts.tag_values("h").into_iter()
+                    .find(|value| value.starts_with("https://") || value.starts_with("http://"))),
                 event,
             },
         );
@@ -549,7 +551,22 @@ impl Feed {
         if releases.iter().any(|old| old.event.id == event.id) {
             return Ok(false);
         }
-        // newest first; equal timestamps keep insertion order
+        // A release's asset list is authoritative. An edited app@version
+        // must not leave superseded assets selectable from the old event.
+        if let Some(index) = releases.iter().position(|old| {
+            old.event.pubkey == event.pubkey
+                && Parts::parse(&old.event).ok().and_then(|p| p.tag("d")).as_deref() == Some(d.as_str())
+        }) {
+            let old = &releases[index];
+            if old.created_at > parts.created_at
+                || (old.created_at == parts.created_at && old.event.id.to_string() <= parts.id)
+            {
+                return Ok(false);
+            }
+            releases.remove(index);
+        }
+        // Newest versions first; replacement above follows NIP-01's
+        // lowest-event-ID tie break for the same address and timestamp.
         let position = releases
             .iter()
             .position(|old| old.created_at < parts.created_at)
@@ -571,17 +588,21 @@ impl Feed {
 
     fn absorb_asset(&mut self, event: Event, parts: Parts) -> Result<bool> {
         let digest = parts.tag("x").map(normalize_digest);
-        // the location: Orchard's own events name an image location
-        // (`oci`); Zapstore-shaped events name a plain https URL the
-        // flatpak bundle is served from
-        let location = parts.tag("oci").or_else(|| parts.tag("url"));
-        // a location that names a different digest than the pin never
-        // stores: the check runs before the insert, so such an asset
-        // is not merely untrusted, it is absent. A skip keeps the
-        // sync alive against hostile events too.
+        let location = parts.tag("url").or_else(|| parts.tag("oci"));
         if !digest_agrees(digest.as_deref(), location.as_deref()) {
             return Ok(false);
         }
+        let blob = if parts.tag_values("T").iter().any(|t| t == orchard_core::oci_asset::PACKAGE) {
+            let (Some(hash), Some(url), Some(mime), Some(size)) =
+                (parts.tag("x"), location.clone(), parts.tag("m"), parts.tag("size").and_then(|s| s.parse().ok())) else {
+                    return Ok(false);
+                };
+            if hash.len() != 64 || orchard_core::oci_asset::hash_hex(&hash).is_err()
+                || !(url.starts_with("https://") || url.starts_with("http://")) {
+                return Ok(false);
+            }
+            Some(orchard_core::oci_asset::BlobAsset { sha256: hash, url, mime, size })
+        } else { None };
         if self.assets.contains_key(&parts.id) {
             return Ok(false);
         }
@@ -590,7 +611,8 @@ impl Feed {
             Asset {
                 created_at: parts.created_at,
                 publisher: parts.pubkey.clone(),
-                platform: parts.tag("f"),
+                platforms: parts.tag_values("f"),
+                blob,
                 digest,
                 location,
                 runtime: parts.tag("runtime"),
@@ -755,13 +777,13 @@ impl Feed {
                     .asset_refs
                     .iter()
                     .filter_map(same_publisher)
-                    .find(|asset| asset.platform.as_deref() == Some(platform))
+                    .find(|asset| asset.platforms.iter().any(|p| p == platform))
                     .or_else(|| {
                         release
                             .asset_refs
                             .iter()
                             .filter_map(same_publisher)
-                            .find(|asset| asset.platform.is_none())
+                            .find(|asset| asset.platforms.is_empty())
                     })
             };
             // walk releases newest-first; first one with an
@@ -834,6 +856,13 @@ impl Feed {
                 flatpak_ref: format!("app/{app_id}/{ref_arch}/stable"),
                 location,
                 digest,
+                oci_assets: asset.filter(|a| a.blob.is_some()).map(|_| {
+                    release.asset_refs.iter().filter_map(|id| self.assets.get(id))
+                        .filter(|a| a.event.pubkey.to_string() == *author)
+                        .filter(|a| a.platforms.iter().any(|p| p == platform))
+                        .filter_map(|a| a.blob.clone())
+                        .filter(|b| b.mime != orchard_core::oci_asset::MIME).collect()
+                }),
                 metadata: None,
                 repository: listing.repository.clone(),
                 homepage: listing.homepage.clone(),
@@ -970,6 +999,84 @@ mod tests {
     /// A realistic test digest (64 hex chars).
     const DIGEST: &str = "f127a079f4a50c3d960e6707aeb7373ee01403cc7b079b9b6fc3743c21a6e7a7";
 
+    #[test]
+    fn homepage_prefers_url_and_accepts_legacy_http_h() {
+        let keys = demo_keys();
+        for (tags, expected) in [
+            (vec![("h", "https://legacy.example")], Some("https://legacy.example")),
+            (vec![("h", DIGEST)], None),
+            (vec![("h", "https://legacy.example"), ("url", "https://current.example")], Some("https://current.example")),
+        ] {
+            let mut tags = tags;
+            tags.push(("d", "com.example.Home"));
+            let event = signed(&keys, KIND_APP, "", tags);
+            let mut feed = Feed::new();
+            assert!(feed.absorb(event).unwrap());
+            assert_eq!(feed.listings.values().next().unwrap().homepage.as_deref(), expected);
+        }
+    }
+
+    #[test]
+    fn edited_release_replaces_its_authoritative_asset_list() {
+        let keys = demo_keys();
+        let make = |time, id: &str| EventBuilder::new(Kind::Custom(KIND_RELEASE as u16), "")
+            .tags([Tag::custom("d", ["com.example.App@1"]), Tag::custom("i", ["com.example.App"]),
+                Tag::custom("version", ["1"]), Tag::custom("e", [id])])
+            .custom_created_at(Timestamp::from_secs(time)).finalize(&keys).unwrap();
+        let old = make(10, &"a".repeat(64));
+        let new = make(20, &"b".repeat(64));
+        let mut feed = Feed::new();
+        assert!(feed.absorb(old.clone()).unwrap());
+        assert!(feed.absorb(new.clone()).unwrap());
+        assert!(!feed.absorb(old).unwrap());
+        let releases = &feed.releases["com.example.App"];
+        assert_eq!(releases.len(), 1);
+        assert_eq!(releases[0].event.id, new.id);
+        assert_eq!(releases[0].asset_refs, ["b".repeat(64)]);
+    }
+
+    #[test]
+    fn standard_release_selects_flatpak_manifest_among_other_formats() {
+        let keys = demo_keys();
+        let listing = signed(&keys, KIND_APP, "", vec![("d", "com.example.App"), ("name", "App"), ("f", "linux-x86_64"), ("f", "linux-aarch64")]);
+        let deb = signed(&keys, KIND_ASSET, "", vec![("i", "com.example.App"), ("version", "1"), ("f", "linux-x86_64"), ("m", "application/vnd.debian.binary-package"), ("x", DIGEST), ("url", "https://example.com/app.deb")]);
+        let container = signed(&keys, KIND_ASSET, "", vec![
+            ("i", "com.example.App"), ("version", "1"), ("f", "linux-x86_64"),
+            ("m", "application/vnd.oci.image.manifest.v1+json"), ("T", "oci"), ("t", "flatpak-oci"),
+            ("x", DIGEST), ("url", "https://example.com/container.json")]);
+        let make_manifest = |platform, url| signed(&keys, KIND_ASSET, "", vec![
+            ("i", "com.example.App"), ("version", "1"), ("f", platform),
+            ("m", "application/vnd.oci.image.manifest.v1+json"), ("T", "flatpak-oci"), ("size", "123"), ("x", DIGEST), ("url", url)]);
+        let x86 = make_manifest("linux-x86_64", "https://example.com/x86.json");
+        let arm = make_manifest("linux-aarch64", "https://example.com/arm.json");
+        let config = signed(&keys, KIND_ASSET, "", vec![("i", "com.example.App"),
+            ("f", "linux-x86_64"), ("T", "flatpak-oci"), ("x", &"b".repeat(64)),
+            ("size", "42"), ("m", "application/vnd.oci.image.config.v1+json"), ("url", "https://elsewhere.example/config")]);
+        let foreign = signed(&Keys::generate(), KIND_ASSET, "", vec![("f", "linux-x86_64"),
+            ("T", "flatpak-oci"), ("x", &"c".repeat(64)), ("size", "42"),
+            ("m", "application/vnd.oci.image.config.v1+json"), ("url", "https://untrusted.example/config")]);
+        let release = signed(&keys, KIND_RELEASE, "", vec![
+            ("d", "com.example.App@1"), ("i", "com.example.App"), ("version", "1"), ("c", "main"),
+            ("e", &config.id.to_string()), ("e", &foreign.id.to_string()), ("e", &deb.id.to_string()), ("e", &container.id.to_string()), ("e", &x86.id.to_string()), ("e", &arm.id.to_string())]);
+        let mut feed = Feed::new();
+        absorb_all(&mut feed, &[listing, deb, container, config, foreign, x86, arm, release]);
+        let catalog = feed.catalog_for("linux-x86_64");
+        let blobs = catalog.apps[0].oci_assets.as_ref().unwrap();
+        assert_eq!(blobs.len(), 1);
+        assert_eq!(blobs[0].url, "https://elsewhere.example/config");
+        assert!(feed.catalog_for("linux-aarch64").apps[0].oci_assets.as_ref().unwrap().is_empty());
+        assert_eq!(feed.catalog_for("linux-x86_64").apps[0].location, "https://example.com/x86.json");
+        assert_eq!(feed.catalog_for("linux-aarch64").apps[0].location, "https://example.com/arm.json");
+    }
+
+    #[test]
+    fn repeated_tags_do_not_treat_relay_hints_as_values() {
+        let event = EventBuilder::new(Kind::Custom(KIND_RELEASE as u16), "")
+            .tag(Tag::custom("e", [DIGEST, "wss://relay.example.com"]))
+            .finalize(&demo_keys()).unwrap();
+        assert_eq!(Parts::parse(&event).unwrap().tag_values("e"), [DIGEST]);
+    }
+
     fn demo_keys() -> Keys {
         Keys::parse("5122b2537caa7e084e8aec9278e222b1a9b53a1cd2dbfb7d76f0b1bd41c8d6ea").unwrap()
     }
@@ -995,7 +1102,7 @@ mod tests {
                 ("t", "Utilities"),
                 ("f", "linux-x86_64"),
                 ("repository", "https://github.com/example/hello"),
-                ("h", "https://hello.example.com"),
+                ("url", "https://hello.example.com"),
             ],
         );
         let asset = signed(

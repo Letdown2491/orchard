@@ -4,11 +4,9 @@
 # in the publish manifest. Orchard then lists Orchard; updating
 # Orchard is its own update path.
 #
-# One listing, both architectures: each runner builds its own arch
-# and signs its own asset and release (per-arch `d`), while the
-# listing declaring coverage for both is identical from either leg.
-# The asset pins the artifact by digest, so the client on any machine
-# pulls the artifact built for it.
+# One release, both architectures: each runner pushes its OCI artifact and
+# exports unsigned asset metadata. The final job signs one release referencing
+# both assets, so architecture jobs cannot overwrite each other's release.
 #
 # Required repository secret:
 #   ORCHARD_NSEC  the publisher identity's secret key (nsec hex)
@@ -29,7 +27,7 @@ permissions:
   packages: write
 
 jobs:
-  publish:
+  prepare:
     strategy:
       fail-fast: false
       matrix:
@@ -51,20 +49,32 @@ jobs:
       - name: Assemble the app tree
         run: ./self/assemble.sh
 
-      - name: Push and sign
+      - name: Push artifact and export metadata
         env:
-          ORCHARD_NSEC: ${{ secrets.ORCHARD_NSEC }}
           ORCHARD_REGISTRY_USER: ${{ github.actor }}
           ORCHARD_REGISTRY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # v1.2.3 becomes 1.2.3
-          export ORCHARD_PUBLISH_VERSION="${GITHUB_REF_NAME#v}"
-          target/release/orchard-publish self/orchard.publish.toml \
-            --arch "${{ matrix.arch }}" \
-            --registry "ghcr.io/${GITHUB_REPOSITORY,,}" \
-            --tag "latest-${{ matrix.arch }}" \
-            --prove
+          # Run the Fedora-built publisher in its build environment.
+          podman run --rm -v "$PWD:/work:Z" -w /work \
+            -e ORCHARD_REGISTRY_USER -e ORCHARD_REGISTRY_PASSWORD \
+            -e ORCHARD_PUBLISH_VERSION="${GITHUB_REF_NAME#v}" \
+            localhost/orchard-dev-rust \
+            target/release/orchard-publish self/orchard.publish.toml \
+            --upload-only --arch "${{ matrix.arch }}" --out dist \
+            --registry "ghcr.io/${GITHUB_REPOSITORY,,}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: asset-${{ matrix.arch }}
+          path: dist/*.asset.json
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v4
+        if: matrix.arch == 'linux-x86_64'
+        with:
+          name: publisher
+          path: target/release/orchard-publish
+          if-no-files-found: error
 
       - name: Attach the artifact to the release
         env:
@@ -75,8 +85,40 @@ jobs:
           # not even try a token on a 401). The release therefore
           # carries the artifact itself, as an oci-archive the README's
           # two-liner installs with flatpak's local path.
-          tar -C "target/publish/rocks.orchard.Orchard" \
-            -czf "orchard-${{ matrix.arch }}.oci.tgz" .
+          cp "dist/rocks.orchard.Orchard-${{ matrix.arch }}.oci.tgz" \
+            "orchard-${{ matrix.arch }}.oci.tgz"
           gh release create "$GITHUB_REF_NAME" --generate-notes || true
           gh release upload "$GITHUB_REF_NAME" \
             "orchard-${{ matrix.arch }}.oci.tgz" --clobber
+
+  publish:
+    needs: prepare
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: asset-*
+          path: dist
+          merge-multiple: true
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: publisher
+          path: dist/bin
+
+      - name: Sign the combined release
+        env:
+          ORCHARD_NSEC: ${{ secrets.ORCHARD_NSEC }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          sudo apt-get update && sudo apt-get install -y podman
+          chmod +x dist/bin/orchard-publish
+          podman run --rm -v "$PWD:/work:Z" -w /work \
+            -e ORCHARD_NSEC -e GITHUB_TOKEN \
+            -e ORCHARD_PUBLISH_VERSION="${GITHUB_REF_NAME#v}" \
+            registry.fedoraproject.org/fedora:43 \
+            dist/bin/orchard-publish self/orchard.publish.toml \
+            --asset dist/rocks.orchard.Orchard-linux-x86_64.asset.json \
+            --asset dist/rocks.orchard.Orchard-linux-aarch64.asset.json --legacy-oci --prove

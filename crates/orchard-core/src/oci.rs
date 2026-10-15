@@ -1,6 +1,7 @@
 //! Minimal OCI artifact access for verification and install.
 //!
-//! Orchard pins artifacts by manifest digest. Before any install the client
+//! HTTP manifest assets use the same manifest pin as registry references.
+//! OCI layouts and registry references are pinned by manifest digest. The client
 //! fetches the manifest from the artifact's location, hashes it, and refuses
 //! to proceed when the hash differs from the catalog pin. This module speaks
 //! just enough of the container ecosystem to do that:
@@ -62,6 +63,8 @@ pub fn sha256_digest(bytes: &[u8]) -> String {
 /// Where an installable artifact lives, parsed from a location string.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Location {
+    /// A NIP-82 OCI manifest on Blossom; child blobs are sibling hash URLs.
+    ManifestUrl(String),
     /// A local OCI image layout directory, e.g. `oci:/path/to/layout`.
     OciDir(PathBuf),
     /// A registry exposed via the Docker v2 API, e.g.
@@ -144,6 +147,7 @@ impl Location {
     /// from `oci:`.)
     pub fn install_arg(&self) -> String {
         match self {
+            Location::ManifestUrl(url) => url.clone(),
             Location::OciDir(path) => format!("oci:{}", path.display()),
             Location::Registry {
                 registry,
@@ -175,6 +179,21 @@ impl Location {
 /// manifest digest actually served.
 pub fn verify(location: &Location, pinned_digest: Option<&str>) -> Result<VerifyReport> {
     match location {
+        Location::ManifestUrl(url) => {
+            let pin = pinned_digest.context("manifest asset requires a SHA-256 pin")?;
+            let bytes = read_body(agent().get(url).call()?.into_reader(), url)?;
+            let digest = sha256_digest(&bytes);
+            check_pin(Some(pin), &digest)?;
+            let mut report = report_from_manifest(&bytes, &digest)?;
+            report.manifest_size = bytes.len() as u64;
+            if let Some(config) = &report.config_digest {
+                let config_url = blossom_blob_url(url, config)?;
+                let bytes = read_body(agent().get(&config_url).call()?.into_reader(), &config_url)?;
+                check_pin(Some(config), &sha256_digest(&bytes))?;
+                apply_config_labels(&bytes, &mut report);
+            }
+            Ok(report)
+        }
         Location::OciDir(dir) => verify_local(dir, pinned_digest),
         Location::Https { url: _ } => {
             bail!("a bundle location verifies against its destination file; use verify_bundle")
@@ -394,34 +413,33 @@ fn resolve_manifest(
     Ok((bytes, digest))
 }
 
-/// Download a registry artifact into a local OCI image layout under
+/// Download a registry or Blossom artifact into a local OCI image layout under
 /// `dest`: the manifest (checked against `pinned` before anything
 /// large moves), then the config and layer blobs, each streamed and
 /// hashed against its own digest. Ends with `index.json` and
 /// `oci-layout`, the exact shape `flatpak install oci:<dir>` reads.
-/// Returns the manifest digest. Registry locations only: an `oci:`
-/// location is already local bytes.
+/// Returns the manifest digest. An `oci:` location is already local bytes.
 pub fn download_layout(location: &Location, pinned: Option<&str>, dest: &Path) -> Result<String> {
-    let (registry, repository, scheme, reference) = match location {
-        Location::Registry {
-            registry,
-            repository,
-            digest,
-            tag,
-            scheme,
-        } => (registry, repository, scheme, digest.as_deref().or(tag.as_deref())),
-        Location::OciDir(_) => {
-            bail!("nothing to download: the location is already a local layout")
-        }
-        Location::Https { .. } => {
-            bail!("nothing to download here: a bundle location downloads through verify_bundle")
-        }
-    };
-    let base = registry_base(registry, scheme.as_deref());
     let agent = agent();
+    let (base, repository) = match location {
+        Location::Registry { registry, repository, scheme, .. } =>
+            (registry_base(registry, scheme.as_deref()), repository.as_str()),
+        Location::ManifestUrl(url) => (url.rsplit_once('/').context("manifest URL has no parent")?.0.to_owned(), ""),
+        Location::OciDir(_) => bail!("location is already a local layout"),
+        Location::Https { .. } => bail!("a bundle downloads through verify_bundle"),
+    };
     let mut fetch = RegistryFetch::new(&agent, repository);
-    let (manifest_bytes, digest) =
-        resolve_manifest(&mut fetch, &base, repository, reference, pinned)?;
+    let (manifest_bytes, digest) = match location {
+        Location::Registry { digest, tag, .. } => resolve_manifest(&mut fetch, &base, repository, digest.as_deref().or(tag.as_deref()), pinned)?,
+        Location::ManifestUrl(url) => {
+            let pin = pinned.context("manifest asset requires a SHA-256 pin")?;
+            let bytes = read_body(agent.get(url).call()?.into_reader(), url)?;
+            let digest = sha256_digest(&bytes);
+            check_pin(Some(pin), &digest)?;
+            (bytes, digest)
+        }
+        Location::OciDir(_) | Location::Https { .. } => unreachable!(),
+    };
 
     let parsed: serde_json::Value = serde_json::from_slice(&manifest_bytes)
         .with_context(|| format!("parsing manifest {digest}"))?;
@@ -490,8 +508,14 @@ fn fetch_blob_to(
     digest: &str,
     blobs: &Path,
 ) -> Result<()> {
-    let url = format!("{base}/v2/{repository}/blobs/{digest}");
+    let hex = crate::oci_asset::hash_hex(digest)?;
+    let url = if repository.is_empty() { format!("{base}/{hex}") }
+        else { format!("{base}/v2/{repository}/blobs/{digest}") };
     let response = fetch.get_response(&url)?;
+    save_blob(response, &url, digest, blobs)
+}
+
+fn save_blob(response: ureq::Response, url: &str, digest: &str, blobs: &Path) -> Result<()> {
     let mut reader = response.into_reader();
     let final_path = blobs.join(digest.trim_start_matches("sha256:"));
     let tmp = final_path.with_extension("part");
@@ -537,6 +561,7 @@ fn finish_registry_report(
     if let Some(config_digest) = report.config_digest.clone() {
         let url = format!("{base}/v2/{repository}/blobs/{config_digest}");
         let config_bytes = fetch.get(&url)?;
+        check_pin(Some(&config_digest), &sha256_digest(&config_bytes))?;
         apply_config_labels(&config_bytes, report);
     }
     Ok(())
@@ -629,8 +654,9 @@ impl<'a> RegistryFetch<'a> {
 
 fn read_body(reader: impl std::io::Read, url: &str) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
-    std::io::Read::read_to_end(&mut { reader }, &mut bytes)
+    std::io::Read::read_to_end(&mut std::io::Read::take(reader, 16 * 1024 * 1024 + 1), &mut bytes)
         .with_context(|| format!("reading body of {url}"))?;
+    if bytes.len() > 16 * 1024 * 1024 { bail!("OCI metadata exceeds size limit"); }
     Ok(bytes)
 }
 
@@ -804,7 +830,11 @@ fn read_local_blob(dir: &Path, digest: &str) -> Result<Vec<u8>> {
     let hex = digest
         .strip_prefix("sha256:")
         .ok_or_else(|| anyhow!("only sha256 digests are supported: {digest}"))?;
+    crate::oci_asset::hash_hex(hex)?;
     let path = dir.join("blobs/sha256").join(hex);
+    if std::fs::metadata(&path)?.len() > 16 * 1024 * 1024 {
+        bail!("OCI metadata blob exceeds size limit");
+    }
     let bytes = std::fs::read(&path)
         .with_context(|| format!("reading {}", path.display()))?;
     let actual = sha256_digest(&bytes);
@@ -1125,4 +1155,235 @@ mod tests {
             "https://localhost:5000"
         );
     }
+}
+
+/// Blossom stores each child blob beside the manifest, addressed by bare hash.
+fn blossom_blob_url(manifest_url: &str, digest: &str) -> Result<String> {
+    let hex = crate::oci_asset::hash_hex(digest)?;
+    let (base, _) = manifest_url.rsplit_once('/').context("manifest URL needs a parent")?;
+    Ok(format!("{base}/{hex}"))
+}
+
+#[cfg(test)]
+mod manifest_asset_tests {
+    use super::*;
+    use std::io::{Read, Write};
+
+    fn fixture() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+        let config = serde_json::to_vec(&serde_json::json!({"config":{"Labels":{
+            "org.flatpak.ref":"app/com.example.App/x86_64/stable",
+            "org.flatpak.metadata":"[Application]\nname=com.example.App\n[Context]\nshared=network;\n"
+        }}})).unwrap();
+        let layer = b"test layer".to_vec();
+        let manifest = serde_json::to_vec(&serde_json::json!({"schemaVersion":2,
+            "mediaType": crate::oci_asset::MIME,
+            "config":{"mediaType":"application/vnd.oci.image.config.v1+json","digest":sha256_digest(&config),"size":config.len()},
+            "layers":[{"mediaType":"application/vnd.oci.image.layer.v1.tar+gzip","digest":sha256_digest(&layer),"size":layer.len()}]
+        })).unwrap();
+        (manifest, config, layer)
+    }
+
+    fn serve(responses: Vec<(String, Vec<u8>)>) -> (String, std::thread::JoinHandle<()>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        listener.set_nonblocking(true).unwrap();
+        let server = std::thread::spawn(move || {
+            for (path, bytes) in responses {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                let mut stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock && std::time::Instant::now() < deadline => std::thread::yield_now(),
+                        Err(e) => panic!("fixture accept: {e}"),
+                    }
+                };
+                stream.set_read_timeout(Some(std::time::Duration::from_secs(10))).unwrap();
+                stream.set_write_timeout(Some(std::time::Duration::from_secs(10))).unwrap();
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    let mut byte = [0];
+                    stream.read_exact(&mut byte).unwrap();
+                    request.push(byte[0]);
+                    assert!(request.len() < 16384);
+                }
+                assert!(String::from_utf8_lossy(&request).starts_with(&format!("GET {path} HTTP/1.1")));
+                write!(stream, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", bytes.len()).unwrap();
+                stream.write_all(&bytes).unwrap();
+            }
+        });
+        (base, server)
+    }
+
+    #[test]
+    fn inspection_fetches_only_manifest_and_config_then_install_verifies_layers() {
+        let (manifest, config, layer) = fixture();
+        let pin = sha256_digest(&manifest);
+        let config_path = format!("/{}", crate::oci_asset::hash_hex(&sha256_digest(&config)).unwrap());
+        let layer_path = format!("/{}", crate::oci_asset::hash_hex(&sha256_digest(&layer)).unwrap());
+        let (base, server) = serve(vec![("/manifest".into(), manifest.clone()), (config_path.clone(), config.clone())]);
+        let report = verify(&Location::ManifestUrl(format!("{base}/manifest")), Some(&pin)).unwrap();
+        assert!(report.metadata.unwrap().contains("shared=network"));
+        assert_eq!(report.digest, pin);
+        server.join().unwrap(); // fixture never serves a layer during inspection
+        let root = std::env::temp_dir().join(format!("orchard-manifest-install-{}", std::process::id()));
+        let (base, server) = serve(vec![("/manifest".into(), manifest.clone()), (config_path.clone(), config.clone()), (layer_path.clone(), layer)]);
+        download_layout(&Location::ManifestUrl(format!("{base}/manifest")), Some(&pin), &root).unwrap();
+        server.join().unwrap();
+        crate::oci_asset::validate_layout(&root).unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
+        let (base, server) = serve(vec![("/manifest".into(), manifest), (config_path, config), (layer_path, b"tampered".to_vec())]);
+        assert!(download_layout(&Location::ManifestUrl(format!("{base}/manifest")), Some(&pin), &root).is_err());
+        server.join().unwrap();
+        assert!(!root.exists());
+    }
+
+    #[test]
+    fn inspection_rejects_wrong_manifest_and_config() {
+        let (manifest, config, _) = fixture();
+        let (base, server) = serve(vec![("/manifest".into(), manifest.clone())]);
+        assert!(verify(&Location::ManifestUrl(format!("{base}/manifest")), Some(&format!("sha256:{}", "0".repeat(64)))).is_err());
+        server.join().unwrap();
+        let pin = sha256_digest(&manifest);
+        let config_path = format!("/{}", crate::oci_asset::hash_hex(&sha256_digest(&config)).unwrap());
+        let (base, server) = serve(vec![("/manifest".into(), manifest), (config_path, b"tampered".to_vec())]);
+        assert!(verify(&Location::ManifestUrl(format!("{base}/manifest")), Some(&pin)).is_err());
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn explicit_assets_resolve_across_hosts_and_bind_descriptors() {
+        use crate::oci_asset::BlobAsset;
+        let (manifest, config, layer) = fixture();
+        let pin = sha256_digest(&manifest);
+        let (manifest_base, manifests) = serve(vec![("/image".into(), manifest.clone()), ("/image".into(), manifest.clone())]);
+        let (blob_base, blobs) = serve(vec![("/config.json".into(), config.clone()),
+            ("/config.json".into(), config.clone()), ("/payload".into(), layer.clone())]);
+        let mut assets = vec![
+            BlobAsset { sha256: crate::oci_asset::hash_hex(&sha256_digest(&config)).unwrap().into(),
+                url: format!("{blob_base}/config.json"), mime: "application/vnd.oci.image.config.v1+json".into(), size: config.len() as u64 },
+            BlobAsset { sha256: crate::oci_asset::hash_hex(&sha256_digest(&layer)).unwrap().into(),
+                url: format!("{blob_base}/payload"), mime: "application/vnd.oci.image.layer.v1.tar+gzip".into(), size: layer.len() as u64 },
+        ];
+        let location = Location::parse(&format!("{manifest_base}/image")).unwrap();
+        let report = verify_with_assets(&location, Some(&pin), Some(&assets)).unwrap();
+        assert!(report.metadata.unwrap().contains("shared=network"));
+        let root = std::env::temp_dir().join(format!("orchard-explicit-assets-{}", std::process::id()));
+        download_layout_with_assets(&location, Some(&pin), &root, Some(&assets)).unwrap();
+        crate::oci_asset::validate_layout(&root).unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
+        manifests.join().unwrap(); blobs.join().unwrap();
+        // Matching platform/target is insufficient: each descriptor must match.
+        assert!(asset_descriptors(&manifest, &assets[..1]).is_err());
+        assets[1].size += 1;
+        assert!(asset_descriptors(&manifest, &assets).is_err());
+        assets[1].size -= 1;
+        assets[1].mime = "application/octet-stream".into();
+        assert!(asset_descriptors(&manifest, &assets).is_err());
+        assets[1].mime = "application/vnd.oci.image.layer.v1.tar+gzip".into();
+        let (base, server) = serve(vec![("/image".into(), manifest),
+            ("/config".into(), config), ("/layer".into(), b"tampered".to_vec())]);
+        assets[0].url = format!("{base}/config"); assets[1].url = format!("{base}/layer");
+        assert!(download_layout_with_assets(&Location::parse(&format!("{base}/image")).unwrap(), Some(&pin), &root, Some(&assets)).is_err());
+        assert!(!root.exists()); server.join().unwrap();
+    }
+
+    #[test]
+    fn registry_manifest_urls_keep_registry_transport() {
+        let digest = format!("sha256:{}", "a".repeat(64));
+        let url = format!("https://ghcr.io/v2/owner/app/manifests/{digest}");
+        // A URL alone cannot distinguish an OCI manifest from a bundle.
+        // Component-aware callers use the signed asset graph to select OCI.
+        assert_eq!(Location::parse(&url).unwrap(), Location::Https { url });
+    }
+}
+
+// Each URL gets its own authentication state, so tokens cannot cross origins.
+fn asset_response(url: &str) -> Result<ureq::Response> {
+    if !(url.starts_with("https://") || url.starts_with("http://")) {
+        bail!("asset URL must use HTTP or HTTPS");
+    }
+    let agent = agent();
+    let path = url.split_once("://").and_then(|(_, rest)| rest.split_once('/')).map(|(_, path)| path);
+    let repository = path.and_then(|path| path.strip_prefix("v2/"))
+        .and_then(|path| path.rsplit_once("/blobs/").or_else(|| path.rsplit_once("/manifests/")))
+        .map(|(repo, _)| repo).unwrap_or("");
+    RegistryFetch::new(&agent, repository).get_response(url)
+}
+
+fn asset_manifest(location: &Location, pin: Option<&str>) -> Result<(Vec<u8>, String)> {
+    let pin = pin.context("manifest asset requires a SHA-256 pin")?;
+    let url = match location {
+        Location::ManifestUrl(url) | Location::Https { url } => url.clone(),
+        Location::Registry { registry, repository, scheme, digest, .. } => {
+            if let Some(digest) = digest { check_pin(Some(pin), digest)?; }
+            format!("{}/v2/{repository}/manifests/{pin}", registry_base(registry, scheme.as_deref()))
+        }
+        Location::OciDir(_) => bail!("software assets require a hosted manifest"),
+    };
+    let bytes = read_body(asset_response(&url)?.into_reader(), &url)?;
+    let digest = sha256_digest(&bytes);
+    check_pin(Some(pin), &digest)?;
+    Ok((bytes, digest))
+}
+
+fn asset_descriptors<'a>(bytes: &[u8], assets: &'a [crate::oci_asset::BlobAsset]) -> Result<Vec<&'a crate::oci_asset::BlobAsset>> {
+    let manifest: serde_json::Value = serde_json::from_slice(bytes)?;
+    let layers = manifest["layers"].as_array().context("manifest has no layers")?;
+    std::iter::once(&manifest["config"]).chain(layers).map(|descriptor| {
+        let hash = crate::oci_asset::hash_hex(descriptor["digest"].as_str().context("missing descriptor digest")?)?;
+        let size = descriptor["size"].as_u64().context("missing descriptor size")?;
+        let mime = descriptor["mediaType"].as_str().context("missing descriptor MIME")?;
+        let matches: Vec<_> = assets.iter().filter(|a| a.sha256 == hash).collect();
+        let asset = *matches.first().context("release has no asset for OCI descriptor")?;
+        if matches.iter().any(|a| a.size != size || a.mime != mime) {
+            bail!("software asset differs from OCI descriptor");
+        }
+        Ok(asset)
+    }).collect()
+}
+
+/// Inspect the signed manifest and its explicitly located config, without layers.
+/// None retains the legacy registry/local-layout transport.
+pub fn verify_with_assets(location: &Location, pin: Option<&str>, assets: Option<&[crate::oci_asset::BlobAsset]>) -> Result<VerifyReport> {
+    let Some(assets) = assets else { return verify(location, pin); };
+    let (bytes, digest) = asset_manifest(location, pin)?;
+    let descriptors = asset_descriptors(&bytes, assets)?;
+    let config = descriptors[0];
+    let config_bytes = read_body(asset_response(&config.url)?.into_reader(), &config.url)?;
+    check_pin(Some(&format!("sha256:{}", config.sha256)), &sha256_digest(&config_bytes))?;
+    if config_bytes.len() as u64 != config.size { bail!("config size differs from asset"); }
+    let mut report = report_from_manifest(&bytes, &digest)?;
+    report.manifest_size = bytes.len() as u64;
+    apply_config_labels(&config_bytes, &mut report);
+    Ok(report)
+}
+
+/// Materialize only the blobs referenced by the verified manifest.
+pub fn download_layout_with_assets(location: &Location, pin: Option<&str>, dest: &Path, assets: Option<&[crate::oci_asset::BlobAsset]>) -> Result<String> {
+    let Some(assets) = assets else { return download_layout(location, pin, dest); };
+    let (bytes, digest) = asset_manifest(location, pin)?;
+    let descriptors = asset_descriptors(&bytes, assets)?;
+    let staging = dest.with_extension("part");
+    let _ = std::fs::remove_dir_all(&staging);
+    let blobs = staging.join("blobs/sha256");
+    std::fs::create_dir_all(&blobs)?;
+    let result = (|| {
+        std::fs::write(blobs.join(crate::oci_asset::hash_hex(&digest)?), &bytes)?;
+        for asset in descriptors {
+            let blob_digest = format!("sha256:{}", asset.sha256);
+            save_blob(asset_response(&asset.url)?, &asset.url, &blob_digest, &blobs)?;
+            if std::fs::metadata(blobs.join(&asset.sha256))?.len() != asset.size {
+                bail!("downloaded blob size differs from descriptor");
+            }
+        }
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes)?;
+        let index = serde_json::json!({"schemaVersion":2,"manifests":[{
+            "mediaType":parsed["mediaType"],"digest":digest,"size":bytes.len()}]});
+        std::fs::write(staging.join("index.json"), serde_json::to_vec(&index)?)?;
+        std::fs::write(staging.join("oci-layout"), br#"{"imageLayoutVersion":"1.0.0"}"#)?;
+        std::fs::rename(&staging, dest)?;
+        Ok(digest)
+    })();
+    if result.is_err() { let _ = std::fs::remove_dir_all(&staging); }
+    result
 }

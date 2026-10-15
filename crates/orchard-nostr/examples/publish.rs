@@ -1,7 +1,7 @@
 //! Sign and publish NIP-82 events for one app release: the hand-rolled
 //! test publisher for the M3 vertical slice, kept as a reference for the
 //! event side of `orchard-publish` (which adds the artifact build and
-//! registry push around it).
+//! manifest preparation around it).
 //!
 //! Usage (all keys/options long-form, no dependencies):
 //!
@@ -13,9 +13,9 @@
 //!       --description "Longer markdown description."
 //!       --icon https://example.com/icon.png --category Utilities
 //!       --version 1.2.0
-//!       --location oci:/srv/registry/app   # or docker://host/repo@sha256:...
-//!       --digest sha256:abcd...            # 64 hex chars
-//!       --runtime org.freedesktop.Platform/x86_64/25.08
+//!       --location https://example.com/app.manifest.json
+//!       --digest abcd...                  # manifest SHA-256, 64 hex chars
+//!       --size 123456                     # manifest bytes
 //!       --channel stable --notes "What changed."
 //!       --author-name "Example Dev" --nip05 dev@example.com
 
@@ -43,7 +43,7 @@ struct Args {
     version: String,
     location: String,
     digest: String,
-    runtime: Option<String>,
+    size: u64,
     channel: String,
     notes: Option<String>,
     author_name: Option<String>,
@@ -66,7 +66,7 @@ fn parse_args() -> Result<Args> {
     let mut version = None;
     let mut location = None;
     let mut digest = None;
-    let mut runtime = None;
+    let mut size = None;
     let mut channel = "stable".to_string();
     let mut notes = None;
     let mut author_name = None;
@@ -90,7 +90,7 @@ fn parse_args() -> Result<Args> {
             "--version" => version = Some(next()?),
             "--location" => location = Some(next()?),
             "--digest" => digest = Some(next()?),
-            "--runtime" => runtime = Some(next()?),
+            "--size" => size = Some(next()?.parse::<u64>()?),
             "--channel" => channel = next()?,
             "--notes" => notes = Some(next()?),
             "--author-name" => author_name = Some(next()?),
@@ -113,7 +113,7 @@ fn parse_args() -> Result<Args> {
         version: version.ok_or_else(|| anyhow::anyhow!("--version required"))?,
         location: location.ok_or_else(|| anyhow::anyhow!("--location required"))?,
         digest: digest.ok_or_else(|| anyhow::anyhow!("--digest required"))?,
-        runtime,
+        size: size.ok_or_else(|| anyhow::anyhow!("--size required"))?,
         channel,
         notes,
         author_name,
@@ -149,9 +149,11 @@ fn run() -> Result<()> {
             app_id: args.app_id.clone(),
             version: args.version.clone(),
             platform: args.arch.clone(),
-            digest: args.digest.clone(),
-            location: args.location.clone(),
-            runtime: args.runtime.clone(),
+            digest: args.digest.trim_start_matches("sha256:").to_string(),
+            url: args.location.clone(),
+            size: args.size,
+            filename: "app.manifest.json".into(),
+            mime: orchard_core::oci_asset::MIME.into(),
         },
     )?;
     let release = events::sign_release(
@@ -159,10 +161,10 @@ fn run() -> Result<()> {
         &Release {
             app_id: args.app_id.clone(),
             version: args.version.clone(),
-            platform: args.arch.clone(),
+            platforms: vec![args.arch.clone()],
             channel: args.channel.clone(),
             notes: args.notes.clone(),
-            asset_id: asset.id.to_string(),
+            asset_ids: vec![asset.id.to_string()],
         },
     )?;
     let listing = events::sign_listing(

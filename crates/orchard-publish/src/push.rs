@@ -363,3 +363,48 @@ mod tests {
         Some(out)
     }
 }
+
+/// The NIP-82 asset URL identifies the immutable manifest bytes in the registry.
+pub fn manifest_url(registry_repo: &str, digest: &str) -> Result<String> {
+    orchard_core::oci_asset::hash_hex(digest)?;
+    let (scheme, rest) = if let Some(rest) = registry_repo.strip_prefix("https://") {
+        (Some("https"), rest)
+    } else if let Some(rest) = registry_repo.strip_prefix("http://") {
+        (Some("http"), rest)
+    } else { (None, registry_repo) };
+    let (registry, repository) = rest.split_once('/').context("registry needs host/repository")?;
+    Ok(format!("{}/v2/{repository}/manifests/{digest}", registry_base(registry, scheme)))
+}
+
+/// Config and layer endpoints share the registry repository and blob digest.
+pub fn blob_url(registry_repo: &str, digest: &str) -> Result<String> {
+    let url = manifest_url(registry_repo, digest)?;
+    let (base, hash) = url.rsplit_once("/manifests/").context("missing manifest endpoint")?;
+    Ok(format!("{base}/blobs/{hash}"))
+}
+
+/// Convert an immutable registry manifest URL into the location v0.2.0 reads.
+/// Direct blob hosts cannot provide this registry compatibility path.
+pub fn legacy_location(url: &str, hash: &str) -> Result<String> {
+    let (scheme, rest) = url.split_once("://").context("manifest URL needs a scheme")?;
+    if !matches!(scheme, "http" | "https") { bail!("manifest URL must use HTTP or HTTPS"); }
+    let (host, path) = rest.split_once("/v2/").context("--legacy-oci requires registry manifest URLs")?;
+    let (repository, digest) = path.rsplit_once("/manifests/").context("--legacy-oci requires registry manifest URLs")?;
+    if host.is_empty() || repository.is_empty() || orchard_core::oci_asset::hash_hex(digest)? != hash {
+        bail!("legacy registry location differs from manifest asset");
+    }
+    Ok(format!("docker://{scheme}://{host}/{repository}@sha256:{hash}"))
+}
+
+#[cfg(test)]
+mod transition_tests {
+    use super::*;
+    #[test]
+    fn legacy_location_requires_a_matching_registry_manifest() {
+        let hash = "a".repeat(64);
+        assert_eq!(legacy_location(&format!("https://ghcr.io/v2/owner/app/manifests/sha256:{hash}"), &hash).unwrap(),
+            format!("docker://https://ghcr.io/owner/app@sha256:{hash}"));
+        assert!(legacy_location(&format!("https://blossom.example/{hash}"), &hash).is_err());
+        assert!(legacy_location(&format!("https://ghcr.io/v2/owner/app/manifests/sha256:{hash}"), &"b".repeat(64)).is_err());
+    }
+}

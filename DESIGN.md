@@ -91,8 +91,8 @@ distribution infrastructure stays at zero central servers.
 - **Install path:** verify the manifest by digest against the release event's pin, then
   stream config and layer blobs into a local OCI image layout
   (`~/.cache/orchard/artifacts/<app-id>/<digest>`, content-addressed, staged by rename)
-  and hand flatpak `oci:<dir>`. Publishing emits asset locations in digest form
-  (`docker://host/repo@sha256:...`), so verify and install resolve immutable bytes.
+  and hand flatpak `oci:<dir>`. Registry asset URLs identify manifests by digest
+  (`https://host/v2/repo/manifests/sha256:...`), so verify and install resolve immutable bytes.
   A finished deploy prunes the app's older layouts; a finished remove drops them all.
 - **Bundle assets (Zapstore-shaped):** an asset may instead carry a plain https
   location (`url` tag: blossom and friends), the sha256 pinned on `x`, and the kind
@@ -115,8 +115,7 @@ distribution infrastructure stays at zero central servers.
 - **Publish CLI (`orchard-publish`):** manifest → build → OCI push → sign → Nostr
   events. The layer and gzip are deterministic, so the same tree builds to the same
   digest. Registry pushes speak the Docker v2 bearer-token dance (anonymous or basic
-  auth); the proof-file write accepts 201 and 200 (first matrix leg creates, second
-  updates). CI (`self-publish.yml`) runs on a `v*` tag, builds in the dev image, and
+  auth); the proof-file write accepts 201 and 200. CI (`self-publish.yml`) runs on a `v*` tag, builds in the dev image, and
   takes the release version from the tag.
 
 ## Nostr protocol (NIP-82 draft, Zapstore-compatible)
@@ -127,15 +126,34 @@ Zapstore publishers readable on Orchard day one:
 | Event | Kind | `d` tag | Tags | Content |
 |---|---|---|---|---|
 | Publisher profile | 0 | (none) | standard NIP-01 | name, nip05, about |
-| App listing | 32267 | `<app-id>` | `name`, `summary`, `icon`, `image`, `t` (categories), `f` (platform), `license`, `repository`, `h` | full description |
-| Release | 30063 | `<app-id>@<version>@<platform>` | `i`, `version`, `f`, `c` (channel), `e` (asset refs) | changelog |
-| Asset | 3063 | (none) | `i`, `x` (sha256), `version`, `url`, `m`, `size`, `f`, **`oci`**, **`runtime`** | (none) |
+| App listing | 32267 | `<app-id>` | `name`, `summary`, `icon`, `image`, `t` (categories), `f` (platform), `license`, `repository`, `url` | full description |
+| Release | 30063 | `<app-id>@<version>` | `a` (application coordinate), `i`, `version`, `f`, `c` (channel), `e` (all asset refs) | changelog |
+| Asset | 3063 | (none) | `i`, `x` (component sha256), `version`, `url`, `m`, `size`, `filename`, `f`, `T` (software target) | (none) |
 | Review | 30065 | `<app-id>` | `rating` (0.0 to 5.0, one decimal) | review text |
 | Publisher migration | 30066 | `<app-id>` | `p` (successor key, hex; omit to revoke) | note |
 
-- `f` values are flatpak arches (`linux-x86_64`, `linux-aarch64`). Asset `oci` names the
-  artifact ref; `x` is the OCI manifest digest pin; asset `runtime` carries the flatpak
-  runtime requirement needed at install time.
+- `f` values describe OS and architecture (`linux-x86_64`, `linux-aarch64`).
+  On kind 3063 assets, `T` identifies the intended packaging or execution
+  environment when platform and MIME type are insufficient to select a compatible
+  consumer. The optional software-target field is proposed for adoption by
+  other NIP-82 implementers. OCI component resolution is client-specific.
+  Manifest, config and layer assets all carry `T=flatpak-oci` and their applicable
+  `f` platforms. MIME type distinguishes the component roles; only a manifest is
+  an installation entry point. Each `url`, bare SHA-256 `x`, and `size` describes
+  that component's bytes. Match the verified manifest's config/layer descriptors
+  to assets in the same signed release by hash, checking MIME and size as well.
+  Registry URLs use `/v2/<repository>/manifests/sha256:<hash>` for manifests and
+  `/v2/<repository>/blobs/sha256:<hash>` for config/layers. Blossom URLs may use
+  any host; no sibling-URL convention or ncontainer event is required. Runtime
+  and permissions come from the verified config, without downloading layers.
+  Public registry URLs can require a bearer-token exchange; generic HTTP
+  consumers need directly downloadable copies, such as Blossom URLs.
+- One release references all architecture assets. `--upload-only` pushes each
+  architecture without signing; `--asset` publishes them together without
+  the build tree. Self-publication enables `--legacy-oci`, adding the same
+  manifest's registry location for v0.2.0 clients. One release serves both
+  readers; config and layer assets do not carry legacy install locations.
+  `--prepare` exports unsigned layouts and component files for other publishers.
 - **Migration:** a 30066 signed by the OLD key hands the app id to a successor; once the
   successor's listing exists, the old row stops projecting. Replaceable per (app id,
   old key); revocation is a newer statement with no `p`. Only the listed key can
