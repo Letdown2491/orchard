@@ -1,5 +1,6 @@
-//! Publish Flatpak OCI artifacts as standard NIP-82 releases.
-//! Architecture jobs upload independently; one publisher signs the release.
+//! Prepare Flatpak OCI manifests and publish standard NIP-82 releases.
+//! Preparation needs no publishing identity. A release may combine prepared
+//! artifacts from separate architecture jobs, with one publisher signing it.
 use anyhow::{Context, Result, bail};
 use nostr::prelude::*;
 use orchard_nostr::events::{self, Asset, Listing, Profile, Release};
@@ -21,9 +22,11 @@ fn main() {
 #[derive(Default)]
 struct Args {
     manifest_path: PathBuf,
+    prepare: bool,
     upload_only: bool,
     legacy_oci: bool,
     assets: Vec<PathBuf>,
+    manifest_url: Option<String>,
     out: Option<PathBuf>,
     arch: Option<String>,
     relays: Option<Vec<String>>,
@@ -46,9 +49,11 @@ fn parse_args() -> Result<Args> {
                 .with_context(|| format!("missing value for {flag}"))
         };
         match flag.as_str() {
+            "--prepare" => args.prepare = true,
             "--upload-only" => args.upload_only = true,
             "--legacy-oci" => args.legacy_oci = true,
             "--asset" => args.assets.push(next()?.into()),
+            "--manifest-url" => args.manifest_url = Some(next()?),
             "--out" => args.out = Some(next()?.into()),
             "--arch" => args.arch = Some(next()?),
             "--relays" => args.relays = Some(relay::parse_urls(&next()?)),
@@ -67,12 +72,17 @@ fn parse_args() -> Result<Args> {
         }
     }
     args.manifest_path = manifest.context(
-        "usage: orchard-publish <manifest.toml> [--registry HOST/REPO] [--upload-only] [--asset FILE ...]",
+        "usage: orchard-publish <manifest.toml> [--prepare] [--manifest-url URL] [--asset FILE ...]",
     )?;
+    if args.prepare
+        && (!args.assets.is_empty() || args.prove || args.registry.is_some() || args.upload_only)
+    {
+        bail!("--prepare cannot publish assets, upload to a registry, or write repository proofs");
+    }
     if args.upload_only && (args.registry.is_none() || args.prove || args.skip_push) {
         bail!("--upload-only requires --registry and cannot use --skip-push or write a repository proof");
     }
-    if !args.assets.is_empty() && args.arch.is_some() {
+    if !args.assets.is_empty() && (args.arch.is_some() || args.manifest_url.is_some()) {
         bail!("--asset uses its recorded architecture and URL; build flags cannot override them");
     }
     Ok(args)
@@ -89,7 +99,7 @@ fn run() -> Result<()> {
     if let Some(arch) = &args.arch {
         manifest.release.arch = arch.clone();
     }
-    if !args.upload_only && !args.skip_relays && args.relays.is_none() {
+    if !args.prepare && !args.upload_only && !args.skip_relays && args.relays.is_none() {
         if let Some(publish) = manifest.publish.as_ref().filter(|p| !p.relays.is_empty()) {
             if !publish
                 .relays
@@ -134,9 +144,12 @@ fn run() -> Result<()> {
             app_id,
             version,
             &manifest.release.arch,
-            None,
+            args.manifest_url.clone(),
         )?;
         eprintln!("prepared {}", path.display());
+        if args.prepare {
+            return Ok(());
+        }
         paths.push(path);
     }
     let mut assets = paths
@@ -199,7 +212,7 @@ fn run() -> Result<()> {
             Ok(Some(push::legacy_location(asset.url.as_deref().context("manifest needs a URL")?, &asset.sha256)?))
         } else { Ok(None) }
     }).collect::<Result<Vec<_>>>()?;
-    // Upload-only returns before loading a signing identity.
+    // Preparation and upload-only return before loading a signing identity.
     let keys = match args.nsec.or_else(|| std::env::var("ORCHARD_NSEC").ok()) {
         Some(raw) => Keys::parse(raw.trim())?,
         None => match manifest.publish.as_ref().and_then(|p| p.key_file.as_ref()) {

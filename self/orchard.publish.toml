@@ -1,4 +1,5 @@
 # CI prepares one layout per architecture and publishes one combined release.
+# Local preparation is safe: orchard-publish self/orchard.publish.toml --prepare
 # Publication uses the public relays below; --relays overrides for local tests.
 
 [app]

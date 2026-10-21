@@ -1,5 +1,5 @@
-//! OCI upload metadata for combining architecture jobs into one release.
-//! The signing job needs only metadata and access to the hosted artifacts.
+//! Portable, unsigned output of Flatpak OCI preparation. Publication can
+//! run on a different machine and does not require the original app tree.
 use anyhow::{Context, Result, bail};
 use orchard_core::oci_asset as asset;
 use serde::{Deserialize, Serialize};
@@ -23,7 +23,7 @@ pub struct Prepared {
     pub components: Vec<Component>,
 }
 
-/// Config/layer descriptors and their registry URLs.
+/// Config/layer bytes exported beside the manifest, with hosting chosen later.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Component {
@@ -101,7 +101,7 @@ pub fn write(
         tar.append_data(&mut header, relative, &mut file)?;
     }
     tar.into_inner()?.finish()?;
-    // Keep the manifest beside upload metadata and the bootstrap archive.
+    // Keep a standalone manifest for NIP-82 publishers and a bootstrap archive.
     let path = output.join(&filename);
     fs::copy(layout.join(&manifest_path), &path)?;
     let (sha256, size) = asset::file_hash(&path)?;
@@ -118,6 +118,7 @@ pub fn write(
     {
         let sha256 = asset::hash_hex(descriptor["digest"].as_str().context("missing digest")?)?.to_string();
         let filename = sha256.clone();
+        fs::copy(layout.join("blobs/sha256").join(&sha256), output.join(&filename))?;
         components.push(Component {
             sha256, filename,
             mime: descriptor["mediaType"].as_str().context("missing component MIME")?.into(),
@@ -204,7 +205,7 @@ pub fn load(path: &Path) -> Result<Prepared> {
             || descriptor["size"].as_u64() != Some(component.size) {
             bail!("component metadata differs from manifest");
         }
-        let (hash, size) = asset::file_hash(&layout.join("blobs/sha256").join(&component.sha256))?;
+        let (hash, size) = asset::file_hash(&path.parent().unwrap_or(Path::new(".")).join(&component.filename))?;
         if hash != component.sha256 || size != component.size { bail!("prepared component changed"); }
     }
     validate_report(&asset, &report)?;
@@ -267,10 +268,10 @@ mod tests {
         assert_eq!(first.components.len(), 2);
         assert!(first.components.iter().all(|c| c.url.is_none()));
         for component in &first.components {
-            let (hash, size) = asset::file_hash(&built.layout.join("blobs/sha256").join(&component.sha256)).unwrap();
+            let (hash, size) = asset::file_hash(&root.join(&component.filename)).unwrap();
             assert_eq!(hash, component.sha256); assert_eq!(size, component.size);
         }
-        let layer_path = built.layout.join("blobs/sha256").join(&first.components[1].sha256);
+        let layer_path = root.join(&first.components[1].filename);
         let layer_bytes = fs::read(&layer_path).unwrap();
         fs::write(&layer_path, "tampered").unwrap();
         assert!(load(&path).is_err());

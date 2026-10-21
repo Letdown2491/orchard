@@ -161,6 +161,7 @@ Zapstore publishers readable on Orchard day one:
   Unknown tags need not prevent other clients from reading compatible assets,
   but MIME and platform alone cannot distinguish Flatpak OCI from other OCI
   targets. Orchard does not infer a Flatpak target for untagged component graphs.
+  `--prepare` exports unsigned layouts and component files for other publishers.
 - **Migration:** a 30066 signed by the OLD key hands the app id to a successor; once the
   successor's listing exists, the old row stops projecting. Replaceable per (app id,
   old key); revocation is a newer statement with no `p`. Only the listed key can

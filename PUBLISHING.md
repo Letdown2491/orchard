@@ -192,8 +192,10 @@ carried one affects availability only.
 | `--arch linux-aarch64` | build for this architecture; prepared `--asset` inputs already record their architecture |
 | `--out dir` | directory for the layout, manifest, bootstrap archive and asset metadata (default `target/publish/<app-id>`) |
 | `--legacy-oci` | add a matching legacy registry location to each manifest asset so v0.2.0 clients can update; requires registry manifest URLs |
+| `--prepare` | build unsigned outputs locally, without uploads or a signing key |
 | `--upload-only` | build or load prepared outputs and push to `--registry`, recording the manifest URL without signing events; permits one architecture of a multi-arch release |
 | `--asset file` | load prepared asset metadata; repeat for every declared platform when publishing; local layouts are required only when pushing with `--registry` |
+| `--manifest-url URL` | record the hosted manifest URL when building or preparing; cannot override a prepared `--asset` |
 | `--skip-push` | skip registry uploads while still signing; use the registry manifest URL or an already-hosted manifest URL |
 | `--skip-relays` | print signed events without contacting relays or inspecting hosted manifests; `--registry` still pushes unless `--skip-push` is set |
 | `--prove` | after a successful publish, refresh the repository proof file (below) |
@@ -202,17 +204,43 @@ Dry runs: `--skip-relays` keeps test events off the public relays entirely.
 Never point a test manifest's relays at the public rendezvous set; test
 events are real events once a relay has them.
 
+## Prepare without publishing
+
+    orchard-publish app.publish.toml --prepare --arch linux-x86_64 --out dist
+
+Preparation creates a `<app-id>-<platform>.layout` OCI directory, a standalone
+`<app-id>-<platform>.manifest.json`, and unsigned `<app-id>-<platform>.asset.json`
+metadata. A `.oci.tgz` is also produced for bootstrap installation. Preparation
+requires no signing key and performs no uploads or relay publication.
+Keep the layout, manifest, exported component files and metadata together
+when transferring outputs for a later registry upload.
+
+The metadata records the app ID, version, platform, format, MIME type, manifest
+filename, hash and size, local layout name, and an optional manifest URL.
+Schema 2 also includes a `components` list for the config and each layer, with
+`sha256`, `mime`, `size`, `filename` and an optional `url`. Component files are
+exported beside the metadata under their bare hashes. Their target and platform
+are inherited from the enclosing record. Preparation needs no hosting details.
+The hash describes the small manifest file, not the bootstrap archive or the
+combined size of its layers.
+
 ## Publish to a registry
 
 The build-and-publish command remains:
 
     orchard-publish app.publish.toml --registry ghcr.io/you/your-app
 
-Publication checks complete platform coverage, verifies the hosted manifest
-and config, and signs the assets and one combined release. Registry tags use
-`<tag>-<platform>`; the signed URLs use immutable manifest digests.
-Credentials remain `ORCHARD_REGISTRY_USER` and `ORCHARD_REGISTRY_PASSWORD`.
-`--tag` overrides `[publish].tag`.
+For multiple architectures, prepare each one separately and publish them together:
+
+    orchard-publish app.publish.toml --registry ghcr.io/you/your-app \
+      --asset dist/com.example.App-linux-x86_64.asset.json \
+      --asset dist/com.example.App-linux-aarch64.asset.json
+
+Publication checks complete platform coverage and local content, pushes each
+layout, verifies the hosted manifest and config, and signs the assets and one
+combined release. Registry tags use `<tag>-<platform>`; the signed URLs use
+immutable manifest digests. Credentials remain `ORCHARD_REGISTRY_USER` and
+`ORCHARD_REGISTRY_PASSWORD`. `--tag` overrides `[publish].tag`.
 
 For CI jobs that upload one architecture before the others are ready, use
 `--upload-only --registry ghcr.io/you/your-app --arch linux-x86_64`. This builds
@@ -227,6 +255,13 @@ only those metadata files:
 Without `--registry`, publication verifies the hosted manifest and config rather
 than requiring local layouts or manifest files. It checks the manifest hash,
 size and Flatpak app/architecture ref before signing the complete release.
+
+For Blossom, upload the manifest, config and layers as individual blobs using
+your chosen publisher. Fill the top-level `url` and each `components[].url`
+with the uploaded file's URL, then run with `--asset` and no `--registry`.
+The files may live on different servers. `--manifest-url` records only the
+manifest URL during preparation; component URLs are assigned after upload.
+Orchard does not require a particular Blossom uploader.
 
 ## Events and inspection
 
@@ -311,6 +346,18 @@ The shape:
 On an aarch64 machine, an app published only for x86_64 still shows, with
 an honest "no aarch64 build yet, published for x86_64" instead of an
 install button that cannot work.
+
+## Use another publisher
+
+Another NIP-82 publisher can use the prepared manifest, config and layers as
+software assets alongside Android or other assets in the same release. For
+each file, preserve its hash, MIME type and size, and apply the enclosing
+record's app ID, version, platform and `T=flatpak-oci` target. Upload the files
+to the chosen host and put each resulting URL in that file's asset event.
+Reference every component asset from the release. No URLs need to be known
+during preparation, and no ncontainer repository event is needed for direct
+Blossom downloads. An ncontainer gateway URL still requires that gateway's
+repository publication independently of these software assets.
 
 ## CI workflow
 
@@ -490,7 +537,7 @@ registrar credential it effectively is.
   migration to a fresh key (below) and stop using it.
 - Without a configured key, publication generates an ephemeral identity and
   prints its secret with a warning. Configure a persistent key for releases.
-  Upload-only mode does not load a signing key.
+  Preparation and upload-only mode do not load a signing key.
 
 ## Rotating keys
 
@@ -564,7 +611,7 @@ repository for reuse, point the listing at the PNG.
       users' remotes can serve (see above): the client pre-flights that
       deploy from this line.
 - [ ] Icon is a PNG URL (see Media above) that resolves publicly.
-- [ ] Upload each architecture and check registry availability.
+- [ ] Prepare each layout and manifest; check registry or Blossom availability.
 - [ ] Dry run with all `--asset` files and `--skip-relays`.
 - [ ] Run with `--prove` (and a `GITHUB_TOKEN` with `contents: write`)
       so the repository link verifies in clients.

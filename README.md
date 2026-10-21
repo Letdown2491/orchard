@@ -105,6 +105,9 @@ committed beside it), and `self-publish.yml` is the workflow that ties
 it together. Architecture jobs push to GHCR and export asset metadata; one job
 publishes a combined release. The version tag triggers it.
 
+Preparation needs no key or network:
+
+    ./target/release/orchard-publish self/orchard.publish.toml --prepare --out dist
 
 **Never run orchard-publish on `self/orchard.publish.toml` bare**: the
 manifest's relay list is the public rendezvous set, so a bare run is a
@@ -144,3 +147,18 @@ real publish. The local dry run must override both:
 ## License
 
 MIT, see `LICENSE`.
+
+### Hello publication smoke test
+
+The **Hello multi-architecture smoke** Actions workflow runs on pull requests
+and can be dispatched manually. Native x86_64 and aarch64 jobs prepare Hello
+without network access, then exercise `--upload-only` against disposable local
+registries. A single job re-hosts both layouts, publishes one combined release
+with `--asset` and `--legacy-oci` to a local relay, and reads the signed events
+back. Native install jobs re-host the exact same bytes, verify and download the
+component graph through Orchard's core, then install and launch Hello.
+
+Layouts and signed events cross job boundaries as artifacts; loopback services
+are recreated on each runner. The workflow uses a public fixture key and no
+repository secrets, production relay, GHCR package, release tag or proof update.
+It tests CLI installation on both architectures, not graphical UI interaction.

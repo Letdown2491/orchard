@@ -1,0 +1,137 @@
+# No release tags, public publication or repository signing secrets.
+name: Hello multi-architecture smoke
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  prepare:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-latest
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install container tooling
+        run: sudo apt-get update && sudo apt-get install -y podman
+      - name: Build native publisher and verification probe
+        run: |
+          ./scripts/build.sh build --release -p orchard-publish
+          ./scripts/build.sh build --release -p orchard-nostr --example hello_smoke
+      - name: Prepare offline and upload to the demo registry
+        run: python3 scripts/hello-smoke.py prepare '${{ matrix.arch }}'
+      # An artifact ZIP does not retain executable modes or OCI tree permissions.
+      - name: Pack prepared files and native tools
+        run: tar -C target/hello-smoke -czf hello-${{ matrix.arch }}.tgz '${{ matrix.arch }}'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hello-${{ matrix.arch }}
+          path: hello-${{ matrix.arch }}.tgz
+          if-no-files-found: error
+      - name: Registry log
+        if: always()
+        run: podman logs hello-registry || true
+
+  publish:
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install container tooling
+        run: sudo apt-get update && sudo apt-get install -y podman
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: hello-*
+          path: artifacts
+          merge-multiple: true
+      - name: Unpack both architecture layouts
+        run: |
+          mkdir -p target/hello-smoke
+          for archive in artifacts/*.tgz; do tar -C target/hello-smoke -xzf "$archive"; done
+      - name: Prepare native binary environment and local relay
+        run: |
+          podman pull registry.fedoraproject.org/fedora:43
+          podman tag registry.fedoraproject.org/fedora:43 localhost/orchard-dev-rust
+          podman build -t localhost/orchard-relay -f containers/orchard-relay.containerfile containers/
+      - name: Re-host layouts and publish one combined release
+        run: python3 scripts/hello-smoke.py publish
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hello-events
+          path: target/hello-smoke/events.jsonl
+          if-no-files-found: error
+      - name: Service logs
+        if: always()
+        run: |
+          podman logs hello-registry || true
+          podman logs hello-relay || true
+
+  install:
+    needs: publish
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install container and Flatpak tooling
+        # Direct OCI image installs require Flatpak 1.17+, first stable in 1.18.
+        run: |
+          sudo add-apt-repository --yes ppa:flatpak/stable
+          sudo apt-get update
+          sudo apt-get install -y podman flatpak dbus-x11
+          flatpak --version
+          version=$(flatpak --version | awk '{print $2}')
+          if ! dpkg --compare-versions "$version" ge 1.18; then
+            echo "::error::The OCI install smoke requires Flatpak 1.18 or newer (found $version)"
+            exit 1
+          fi
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: hello-*
+          path: artifacts
+          merge-multiple: true
+      - name: Restore exact published bytes and verify the component graph
+        run: |
+          mkdir -p target/hello-smoke
+          for archive in artifacts/*.tgz; do tar -C target/hello-smoke -xzf "$archive"; done
+          cp artifacts/events.jsonl target/hello-smoke/events.jsonl
+          podman pull registry.fedoraproject.org/fedora:43
+          podman tag registry.fedoraproject.org/fedora:43 localhost/orchard-dev-rust
+          python3 scripts/hello-smoke.py restore '${{ matrix.arch }}'
+      - name: Install and launch on the native architecture
+        shell: bash
+        run: |
+          set -euo pipefail
+          flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
+          flatpak install --user -y --noninteractive flathub 'org.freedesktop.Platform/${{ matrix.arch }}/25.08'
+          dbus-run-session -- flatpak install --user -y --noninteractive --no-deps "oci:$PWD/target/hello-smoke/install.layout"
+          test "$(flatpak info --user --show-ref rocks.orchard.Hello)" = 'app/rocks.orchard.Hello/${{ matrix.arch }}/stable'
+          dbus-run-session -- flatpak run rocks.orchard.Hello | tee target/hello-smoke/launch.txt
+          grep -q 'Hello from Orchard!' target/hello-smoke/launch.txt
+          test -s "$HOME/orchard-hello.txt"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: hello-install-${{ matrix.arch }}
+          path: target/hello-smoke/launch.txt
+      - name: Registry log
+        if: always()
+        run: podman logs hello-registry || true
