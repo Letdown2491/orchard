@@ -1,27 +1,15 @@
-//! Publisher CLI: the whole M5 pipeline in one command.
-//!
-//!     orchard-publish app.publish.toml \
-//!       --registry localhost:5000/hello    # push (else local layout only)
-//!
-//! Steps: parse the manifest, build the app tree into a deterministic OCI
-//! layout, push to the publisher's registry (optional), sign the NIP-82
-//! events (asset, release, listing, optional profile), send them to the
-//! relays. Sandbox permissions never leave the artifact: the ini in the
-//! tree rides the image config labels, and the event pins the manifest
-//! digest that carries them.
-
-use std::path::PathBuf;
-
-use anyhow::{bail, Result};
+//! Publish Flatpak OCI artifacts as standard NIP-82 releases.
+//! Architecture jobs upload independently; one publisher signs the release.
+use anyhow::{Context, Result, bail};
 use nostr::prelude::*;
-
-mod artifact;
-mod manifest;
-mod proof;
-mod push;
-
 use orchard_nostr::events::{self, Asset, Listing, Profile, Release};
 use orchard_nostr::relay;
+use std::path::PathBuf;
+mod artifact;
+mod manifest;
+mod prepared;
+mod proof;
+mod push;
 
 fn main() {
     if let Err(err) = run() {
@@ -30,133 +18,192 @@ fn main() {
     }
 }
 
+#[derive(Default)]
 struct Args {
     manifest_path: PathBuf,
-    registry: Option<String>,
-    /// Override the manifest's push tag: CI's matrix pushes one image
-    /// per arch, and two legs writing one tag would flap `latest`
-    /// between architectures. The event's location carries the digest
-    /// form, so this tag never decides what a client installs; it is
-    /// a stable handle for humans and container tools.
-    tag: Option<String>,
-    relays: Option<Vec<String>>,
-    nsec: Option<String>,
+    upload_only: bool,
+    legacy_oci: bool,
+    assets: Vec<PathBuf>,
     out: Option<PathBuf>,
     arch: Option<String>,
+    relays: Option<Vec<String>>,
+    nsec: Option<String>,
     skip_relays: bool,
     skip_push: bool,
-    /// After a successful publish, write the publisher's hex key to
-    /// `orchard.txt` at the manifest's repository (a `GITHUB_TOKEN`
-    /// with `contents:write` must be set): the repository proof.
     prove: bool,
+    registry: Option<String>,
+    tag: Option<String>,
 }
 
 fn parse_args() -> Result<Args> {
     let mut values = std::env::args().skip(1);
-    let mut manifest_path = None;
-    let mut registry = None;
-    let mut tag = None;
-    let mut relays = None;
-    let mut nsec = std::env::var("ORCHARD_NSEC").ok();
-    let mut out = None;
-    let mut skip_relays = false;
-    let mut skip_push = false;
-    let mut prove = false;
-    let mut arch = None;
+    let mut args = Args::default();
+    let mut manifest = None;
     while let Some(flag) = values.next() {
         let mut next = || {
-            values.next().ok_or_else(|| anyhow::anyhow!("missing value for {flag}"))
+            values
+                .next()
+                .with_context(|| format!("missing value for {flag}"))
         };
         match flag.as_str() {
-            "--registry" => registry = Some(next()?),
-            "--tag" => tag = Some(next()?),
-            "--relays" => {
-                relays = Some(
-                    next()?
-                        .split(',')
-                        .map(str::trim)
-                        .filter(|url| !url.is_empty())
-                        .map(str::to_string)
-                        .collect(),
-                )
-            }
-            "--nsec" => nsec = Some(next()?),
-            "--out" => out = Some(PathBuf::from(next()?)),
-            "--arch" => arch = Some(next()?),
-            "--skip-relays" => skip_relays = true,
-            "--skip-push" => skip_push = true,
-            "--prove" => prove = true,
+            "--upload-only" => args.upload_only = true,
+            "--legacy-oci" => args.legacy_oci = true,
+            "--asset" => args.assets.push(next()?.into()),
+            "--out" => args.out = Some(next()?.into()),
+            "--arch" => args.arch = Some(next()?),
+            "--relays" => args.relays = Some(relay::parse_urls(&next()?)),
+            "--nsec" => args.nsec = Some(next()?),
+            "--skip-relays" => args.skip_relays = true,
+            "--skip-push" => args.skip_push = true,
+            "--prove" => args.prove = true,
+            "--registry" => args.registry = Some(next()?),
+            "--tag" => args.tag = Some(next()?),
             other if other.starts_with('-') => bail!("unknown flag {other:?}"),
             other => {
-                if manifest_path.is_some() {
-                    bail!("one manifest per run (got {other:?} after another)")
+                if manifest.replace(PathBuf::from(other)).is_some() {
+                    bail!("one manifest per run");
                 }
-                manifest_path = Some(PathBuf::from(other));
             }
         }
     }
-    Ok(Args {
-        manifest_path: manifest_path.ok_or_else(|| anyhow::anyhow!("usage: orchard-publish <manifest.toml> [--registry registry/repo] [--tag tag] [--relays urls]"))?,
-        registry,
-        tag,
-        relays,
-        nsec,
-        out,
-        arch,
-        skip_relays,
-        skip_push,
-        prove,
-    })
+    args.manifest_path = manifest.context(
+        "usage: orchard-publish <manifest.toml> [--registry HOST/REPO] [--upload-only] [--asset FILE ...]",
+    )?;
+    if args.upload_only && (args.registry.is_none() || args.prove || args.skip_push) {
+        bail!("--upload-only requires --registry and cannot use --skip-push or write a repository proof");
+    }
+    if !args.assets.is_empty() && args.arch.is_some() {
+        bail!("--asset uses its recorded architecture and URL; build flags cannot override them");
+    }
+    Ok(args)
 }
 
 fn run() -> Result<()> {
     let args = parse_args()?;
     let mut manifest = manifest::load(&args.manifest_path)?;
-    // The required relay is publish policy, checked before any build or
-    // push: a manifest-driven send must reach the relay the project
-    // operates, because the third-party relays can refuse or drop
-    // Orchard events at any time. Three paths are exempt:
-    // --skip-relays publishes nothing, --relays is the documented
-    // local-test override, and a manifest with no [publish] section
-    // targets the dev relay.
-    if !args.skip_relays
-        && args.relays.is_none()
-        && let Some(publish) = manifest.publish.as_ref().filter(|p| !p.relays.is_empty())
-        && !publish.relays.iter().any(|url| url == relay::REQUIRED_RELAY)
-    {
-        bail!(
-            "[publish] relays must include {}, the required rendezvous relay; \
-             --relays bypasses this check for local tests",
-            relay::REQUIRED_RELAY
-        );
+    if let Ok(version) = std::env::var("ORCHARD_PUBLISH_VERSION") {
+        if !version.trim().is_empty() {
+            manifest.release.version = version.trim().into();
+        }
     }
-    // CI derives the version from the pushed tag; the manifest's
-    // version is the local default.
-    if let Ok(from_env) = std::env::var("ORCHARD_PUBLISH_VERSION")
-        && !from_env.trim().is_empty()
-    {
-        manifest.release.version = from_env.trim().to_string();
-    }
-    // CI's arch legs override the manifest's build arch: the
-    // artifact, asset, and release of this run are for that machine,
-    // while the listing keeps its full declared coverage
     if let Some(arch) = &args.arch {
         manifest.release.arch = arch.clone();
     }
+    if !args.upload_only && !args.skip_relays && args.relays.is_none() {
+        if let Some(publish) = manifest.publish.as_ref().filter(|p| !p.relays.is_empty()) {
+            if !publish
+                .relays
+                .iter()
+                .any(|url| url == relay::REQUIRED_RELAY)
+            {
+                bail!(
+                    "[publish] relays must include {}; --relays overrides for local tests",
+                    relay::REQUIRED_RELAY
+                );
+            }
+        }
+    }
     let app_id = &manifest.app.id;
     let version = &manifest.release.version;
-
-    // keys: flag beats env beats manifest key file; nothing means
-    // generate (with a loud warning, an ephemeral identity is almost
-    // never what a publisher wants)
-    let keys = match args.nsec.as_deref().map(str::to_string) {
-        Some(raw) => Keys::parse(raw.trim())?,
-        None => match &manifest.publish.as_ref().and_then(|p| p.key_file.as_ref()) {
-            Some(key_file) => {
-                let raw = std::fs::read_to_string(key_file).map(|content| content.trim().to_string())
-                    .map_err(|err| anyhow::anyhow!("reading key file {}: {err}", key_file.display()))?;
-                Keys::parse(&raw)?
+    let mut paths = args.assets.clone();
+    if paths.is_empty() {
+        let out = args
+            .out
+            .clone()
+            .unwrap_or_else(|| PathBuf::from(format!("target/publish/{app_id}")));
+        let built = artifact::build(
+            &manifest.artifact.tree,
+            &out.join(format!("{app_id}-{}.layout", manifest.release.arch)),
+            app_id,
+            version,
+            &manifest.ref_arch(),
+            manifest.release.notes.as_deref(),
+        )?;
+        eprintln!(
+            "built {}: manifest {}, layer {}, diff {}, download {} bytes, installed {} bytes",
+            app_id,
+            built.manifest_digest,
+            built.layer_digest,
+            built.diff_id,
+            built.download_size,
+            built.installed_size
+        );
+        let path = prepared::write(
+            &built.layout,
+            &out,
+            app_id,
+            version,
+            &manifest.release.arch,
+            None,
+        )?;
+        eprintln!("prepared {}", path.display());
+        paths.push(path);
+    }
+    let mut assets = paths
+        .iter()
+        .map(|path| {
+            if args.registry.is_some() && !args.skip_push {
+                prepared::load(path)
+            } else {
+                prepared::load_metadata(path)
             }
+        })
+        .collect::<Result<Vec<_>>>()?;
+    // Validate identity before uploading; signing requires complete coverage.
+    validate_assets(&manifest, &assets, !args.upload_only)?;
+    for (path, asset) in paths.iter().zip(&mut assets) {
+        if let Some(registry) = &args.registry {
+            let digest = if args.skip_push {
+                format!("sha256:{}", asset.sha256)
+            } else {
+                let tag = args
+                    .tag
+                    .as_deref()
+                    .or_else(|| manifest.publish.as_ref().map(|p| p.tag.as_str()))
+                    .unwrap_or("latest");
+                let layout = path
+                    .parent()
+                    .unwrap_or(std::path::Path::new("."))
+                    .join(&asset.layout);
+                let digest =
+                    push::push_layout(registry, &format!("{tag}-{}", asset.platform), &layout)?;
+                if orchard_core::oci_asset::hash_hex(&digest)? != asset.sha256 {
+                    bail!("registry manifest differs from prepared artifact");
+                }
+                digest
+            };
+            asset.url = Some(push::manifest_url(registry, &digest)?);
+            for component in &mut asset.components {
+                component.url = Some(push::blob_url(registry, &format!("sha256:{}", component.sha256))?);
+            }
+            std::fs::write(path, serde_json::to_vec_pretty(&asset)?)?;
+        }
+        let url = asset
+            .url
+            .as_deref()
+            .context("publish needs --registry or a prepared manifest URL")?;
+        let location = orchard_core::oci::Location::parse(url)?;
+        let components = asset.blob_assets()?;
+        if !args.skip_relays {
+            let report = orchard_core::oci::verify_with_assets(
+                &location, Some(&format!("sha256:{}", asset.sha256)), Some(&components))?;
+            prepared::validate_report(asset, &report)?;
+        }
+    }
+    if args.upload_only {
+        return Ok(());
+    }
+    // Validate transition locations before loading keys or publishing anything.
+    let legacy_locations = assets.iter().map(|asset| {
+        if args.legacy_oci {
+            Ok(Some(push::legacy_location(asset.url.as_deref().context("manifest needs a URL")?, &asset.sha256)?))
+        } else { Ok(None) }
+    }).collect::<Result<Vec<_>>>()?;
+    // Upload-only returns before loading a signing identity.
+    let keys = match args.nsec.or_else(|| std::env::var("ORCHARD_NSEC").ok()) {
+        Some(raw) => Keys::parse(raw.trim())?,
+        None => match manifest.publish.as_ref().and_then(|p| p.key_file.as_ref()) {
+            Some(path) => Keys::parse(std::fs::read_to_string(path)?.trim())?,
             None => {
                 let generated = Keys::generate();
                 eprintln!(
@@ -167,88 +214,32 @@ fn run() -> Result<()> {
             }
         },
     };
-    let publisher = keys.get_public_key()?.to_string();
-    use nostr::nips::nip19::ToBech32 as _;
-    let publisher_npub = keys
-        .get_public_key()?
-        .to_bech32()
-        .map_err(|err| anyhow::anyhow!("npub encoding: {err}"))?;
-    println!("publisher {publisher} ({publisher_npub})");
-
-    // build
-    let out = args
-        .out
-        .clone()
-        .unwrap_or_else(|| PathBuf::from(format!("target/publish/{app_id}")));
-    let built = artifact::build(
-        &manifest.artifact.tree,
-        &out,
-        app_id,
-        version,
-        &manifest.ref_arch(),
-        manifest.release.notes.as_deref(),
-    )?;
-    println!(
-        "built {} {}:\n  layer    {}\n  diff id  {}\n  artifact {}",
-        app_id,
-        version,
-        built.layer_digest,
-        built.diff_id,
-        built.manifest_digest
-    );
-
-    // push: the location carries the digest form, so the client's
-    // verify and install both fetch the exact bytes this run built;
-    // the tag is a per-arch handle for humans and container tools
-    let location = match (&args.registry, args.skip_push) {
-        (Some(registry_repo), false) => {
-            let tag = args
-                .tag
-                .as_deref()
-                .or_else(|| {
-                    manifest
-                        .publish
-                        .as_ref()
-                        .map(|p| p.tag.as_str())
-                })
-                .unwrap_or("latest");
-            let digest = push::push_layout(registry_repo, tag, &built.layout)?;
-            if digest != built.manifest_digest {
-                bail!("registry serves {digest}, built {built_digest}", built_digest = built.manifest_digest);
-            }
-            println!("pushed as {registry_repo}:{tag}");
-            format!("docker://{registry_repo}@{digest}")
+    let mut signed = Vec::new();
+    for (asset, legacy) in assets.iter().zip(&legacy_locations) {
+        let components = std::iter::once((
+            &asset.sha256, &asset.mime, asset.size, &asset.filename, &asset.url,
+        )).chain(asset.components.iter().map(|c| (&c.sha256, &c.mime, c.size, &c.filename, &c.url)));
+        for (hash, mime, size, filename, url) in components {
+            signed.push(events::sign_asset_with_legacy_location(&keys, &Asset {
+                app_id: app_id.clone(), version: version.clone(),
+                platform: asset.platform.clone(), digest: hash.clone(),
+                url: url.clone().context("component needs a public URL")?,
+                size, filename: filename.clone(), mime: mime.clone(),
+            }, if mime == orchard_core::oci_asset::MIME { legacy.as_deref() } else { None })?);
         }
-        _ => format!("oci:{}", built.layout.display()),
-    };
-
-    // sign: asset first so the release can reference its id. The
-    // asset and release carry this run's arch (the --arch override
-    // for CI matrix legs); the listing carries the full declared
-    // coverage, identical from every leg.
-    let asset = events::sign_asset(
-        &keys,
-        &Asset {
-            app_id: app_id.clone(),
-            version: version.clone(),
-            platform: manifest.release.arch.clone(),
-            digest: built.manifest_digest.clone(),
-            location: location.clone(),
-            runtime: manifest.runtime_for_build(),
-        },
-    )?;
-    let release = events::sign_release(
+    }
+    signed.push(events::sign_release(
         &keys,
         &Release {
             app_id: app_id.clone(),
             version: version.clone(),
-            platform: manifest.release.arch.clone(),
             channel: manifest.release.channel.clone(),
             notes: manifest.release.notes.clone(),
-            asset_id: asset.id.to_string(),
+            platforms: assets.iter().map(|a| a.platform.clone()).collect(),
+            asset_ids: signed.iter().map(|e| e.id.to_string()).collect(),
         },
-    )?;
-    let listing = events::sign_listing(
+    )?);
+    signed.push(events::sign_listing(
         &keys,
         &Listing {
             app_id: app_id.clone(),
@@ -263,79 +254,126 @@ fn run() -> Result<()> {
             repository: manifest.app.repository.clone(),
             homepage: manifest.app.homepage.clone(),
         },
-    )?;
-    let mut signed = vec![asset, release, listing];
-    if let Some(publish) = &manifest.publish
-        && (publish.author_name.is_some() || publish.nip05.is_some())
-    {
-        signed.push(events::sign_profile(
-            &keys,
-            &Profile {
-                name: publish.author_name.clone(),
-                nip05: publish.nip05.clone(),
-            },
-        )?);
+    )?);
+    if let Some(publish) = &manifest.publish {
+        if publish.author_name.is_some() || publish.nip05.is_some() {
+            signed.push(events::sign_profile(
+                &keys,
+                &Profile {
+                    name: publish.author_name.clone(),
+                    nip05: publish.nip05.clone(),
+                },
+            )?);
+        }
     }
-
-    // send
     if args.skip_relays {
-        println!("{} events signed, not sent (--skip-relays)", signed.len());
+        for event in &signed {
+            println!("{}", event.as_json());
+        }
     } else {
-        let default_relays = vec!["ws://127.0.0.1:8008".to_string()];
-        let relays = args.relays.clone().or_else(|| {
-            manifest
-                .publish
-                .as_ref()
-                .filter(|p| !p.relays.is_empty())
-                .map(|p| p.relays.clone())
-        });
-        for relay_url in relays.unwrap_or(default_relays) {
-            relay::send(&relay_url, &signed)?;
+        let relays = args
+            .relays
+            .or_else(|| {
+                manifest
+                    .publish
+                    .as_ref()
+                    .filter(|p| !p.relays.is_empty())
+                    .map(|p| p.relays.clone())
+            })
+            .unwrap_or_else(|| vec!["ws://127.0.0.1:8008".into()]);
+        for url in relays {
+            relay::send(&url, &signed)?;
         }
-        println!("{} events published to the relays", signed.len());
+        println!("published {} assets in one release", assets.len());
     }
-
-    println!(
-        "done:\n  app       {app_id} {version}\n  artifact  {}\n  location  {location}\n  sizes     {} down, {} installed",
-        built.manifest_digest,
-        human_bytes(built.download_size),
-        human_bytes(built.installed_size)
-    );
-
-    // repository proof: after a successful publish, write the
-    // publisher's key to the manifest's repository. Needs --prove and
-    // a GITHUB_TOKEN with contents:write; a local run without the
-    // token skips with a note, never an error.
-    if args.prove {
-        let repo = manifest.app.repository.as_deref().and_then(proof::github_repo);
-        match repo {
-            Some(repo) => {
-                let token = std::env::var("GITHUB_TOKEN").unwrap_or_default();
-                if token.trim().is_empty() {
-                    eprintln!("proof: --prove set but GITHUB_TOKEN is not; the repository {repo} keeps whatever proof it has");
-                } else {
-                    proof::write_proof(&repo, &publisher_npub, token.trim())?;
-                    println!("proof: orchard.txt refreshed at {repo}");
-                }
-            }
-            None => eprintln!(
-                "proof: --prove set but the manifest's repository is not a github repo; nothing proved"
-            ),
-        }
+    if args.prove && !args.skip_relays {
+        use nostr::nips::nip19::ToBech32;
+        let repo = manifest
+            .app
+            .repository
+            .as_deref()
+            .and_then(proof::github_repo)
+            .context("--prove requires a GitHub repository URL")?;
+        let token = std::env::var("GITHUB_TOKEN").context("--prove requires GITHUB_TOKEN")?;
+        proof::write_proof(&repo, &keys.get_public_key()?.to_bech32()?, &token)?;
     }
     Ok(())
 }
 
-/// Same scale the client shows (`human_size` in the store): a size a
-/// human can compare against the download page.
-fn human_bytes(size: u64) -> String {
-    const KB: f64 = 1024.0;
-    let size = size as f64;
-    if size >= KB * KB {
-        format!("{:.1} MiB", size / (KB * KB))
-    } else if size >= KB {
-        format!("{:.1} KiB", size / KB)
-    } else {
-        format!("{size} B")
+fn validate_assets(
+    manifest: &manifest::Manifest,
+    assets: &[prepared::Prepared],
+    complete: bool,
+) -> Result<()> {
+    let mut platforms = std::collections::BTreeSet::new();
+    for asset in assets {
+        if asset.app_id != manifest.app.id || asset.version != manifest.release.version {
+            bail!("prepared asset belongs to another application or version");
+        }
+        if !platforms.insert(asset.platform.clone()) {
+            bail!("duplicate prepared platform");
+        }
+        if let Some(url) = &asset.url {
+            if !(url.starts_with("https://") || url.starts_with("http://")) {
+                bail!("manifest URL must use HTTP or HTTPS");
+            }
+        }
+    }
+    let expected: std::collections::BTreeSet<_> =
+        manifest.listing_platforms().into_iter().collect();
+    if (complete && platforms != expected) || !platforms.is_subset(&expected) {
+        bail!("publish all declared platforms together: expected {expected:?}, got {platforms:?}");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn publication_requires_exact_platform_coverage_and_matching_identity() {
+        let manifest: manifest::Manifest = toml::from_str(
+            r#"
+[app]
+id = "com.example.App"
+name = "App"
+summary = "Example"
+[release]
+version = "1"
+platforms = ["linux-x86_64", "linux-aarch64"]
+[artifact]
+tree = "absent"
+"#,
+        )
+        .unwrap();
+        let make = |platform: &str| prepared::Prepared {
+            schema: 2,
+            app_id: "com.example.App".into(),
+            version: "1".into(),
+            platform: platform.into(),
+            package: "flatpak-oci".into(),
+            components: Vec::new(),
+            mime: orchard_core::oci_asset::MIME.into(),
+            filename: format!("{platform}.json"),
+            layout: format!("{platform}.layout"),
+            sha256: "a".repeat(64),
+            size: 1,
+            url: Some(format!("https://example.com/{platform}.tgz")),
+        };
+        assert!(validate_assets(&manifest, &[make("linux-x86_64")], true).is_err());
+        assert!(
+            validate_assets(
+                &manifest,
+                &[make("linux-x86_64"), make("linux-x86_64")],
+                true
+            )
+            .is_err()
+        );
+        assert!(validate_assets(&manifest, &[make("linux-x86_64")], false).is_ok());
+        assert!(validate_assets(&manifest, &[make("linux-riscv64")], false).is_err());
+        let mut assets = [make("linux-x86_64"), make("linux-aarch64")];
+        assert!(validate_assets(&manifest, &assets, true).is_ok());
+        assets[1].version = "2".into();
+        assert!(validate_assets(&manifest, &assets, true).is_err());
     }
 }

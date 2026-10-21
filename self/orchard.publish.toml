@@ -1,11 +1,5 @@
-# Orchard publishing itself: the same path every publisher uses,
-# run on our own artifact. CI runs this on a version tag with
-# ORCHARD_NSEC as the only secret; a local run against the demo
-# registry is the dry run, with --relays overriding the public
-# relays below (you never want a test publish landing on them).
-#
-#   ORCHARD_NSEC=<key> orchard-publish self/orchard.publish.toml \
-#     --registry ghcr.io/letdown2491/orchard
+# CI prepares one layout per architecture and publishes one combined release.
+# Publication uses the public relays below; --relays overrides for local tests.
 
 [app]
 id = "rocks.orchard.Orchard"
@@ -17,12 +11,10 @@ repository = "https://github.com/Letdown2491/orchard"
 icon = "https://raw.githubusercontent.com/Letdown2491/orchard/main/assets/orchard-512.png"
 
 [release]
-version = "0.2.1"
+version = "0.3.0"
 arch = "linux-x86_64"
-# the full coverage both CI legs build; every leg publishes the same
-# listing, and each host picks the artifact built for it
+# Every declared platform must be present in the combined release.
 platforms = ["linux-x86_64", "linux-aarch64"]
-runtime = "org.freedesktop.Platform/x86_64/25.08"
 notes = "App pages show screenshots: publisher listings carry image URLs (the same strip reviewed apps always had). First release through the self-update chain: coming from 0.2.0, update in place; nothing to do by hand."
 
 [artifact]

@@ -23,35 +23,31 @@ pub struct Listing {
     pub screenshots: Vec<String>,
     pub license: Option<String>,
     pub repository: Option<String>,
-    /// The project's homepage, the `h` tag.
+    /// The project's homepage, the NIP-82 `url` tag.
     pub homepage: Option<String>,
 }
 
-/// One asset (kind 3063): the artifact pin.
+/// One downloadable Flatpak OCI component (kind 3063).
 pub struct Asset {
     pub app_id: String,
     pub version: String,
-    /// The platform this artifact was built for, e.g. `linux-x86_64`.
     pub platform: String,
-    /// `sha256:<hex>` of the artifact manifest.
+    /// Bare SHA-256 of the component bytes.
     pub digest: String,
-    /// `oci:/path` or `docker://registry/repo@sha256:<hex>`.
-    pub location: String,
-    pub runtime: Option<String>,
+    pub url: String,
+    pub size: u64,
+    pub filename: String,
+    pub mime: String,
 }
 
-/// One release (kind 30063). `d` is `<app-id>@<version>@<platform>`
-/// (per-arch identity: two arches of one version are two releases and
-/// must not replace each other); `e` refs the signed asset event.
+/// One release per application version, referencing every architecture.
 pub struct Release {
     pub app_id: String,
     pub version: String,
-    /// The platform this release was built for, e.g. `linux-x86_64`.
-    pub platform: String,
+    pub platforms: Vec<String>,
     pub channel: String,
     pub notes: Option<String>,
-    /// Hex id of the signed asset event.
-    pub asset_id: String,
+    pub asset_ids: Vec<String>,
 }
 
 /// One publisher profile (kind 0).
@@ -85,7 +81,7 @@ pub fn sign_listing(keys: &Keys, listing: &Listing) -> Result<Event> {
         .tag_maybe(optional_tag("icon", &listing.icon))
         .tag_maybe(optional_tag("license", &listing.license))
         .tag_maybe(optional_tag("repository", &listing.repository))
-        .tag_maybe(optional_tag("h", &listing.homepage));
+        .tag_maybe(optional_tag("url", &listing.homepage));
     let builder = listing
         .categories
         .iter()
@@ -102,30 +98,53 @@ pub fn sign_listing(keys: &Keys, listing: &Listing) -> Result<Event> {
 }
 
 pub fn sign_asset(keys: &Keys, asset: &Asset) -> Result<Event> {
-    let builder = EventBuilder::new(Kind::Custom(crate::KIND_ASSET as u16), "")
+    sign_asset_with_legacy_location(keys, asset, None)
+}
+
+/// Add a registry location understood by Orchard v0.2.0 to a manifest asset.
+/// Both locations must identify the same manifest digest.
+pub fn sign_asset_with_legacy_location(keys: &Keys, asset: &Asset, legacy: Option<&str>) -> Result<Event> {
+    if let Some(location) = legacy {
+        if asset.mime != orchard_core::oci_asset::MIME {
+            anyhow::bail!("only manifest assets can carry a legacy OCI location");
+        }
+        match orchard_core::oci::Location::parse(location)? {
+            orchard_core::oci::Location::Registry { digest: Some(digest), .. }
+                if orchard_core::oci_asset::hash_hex(&digest)? == asset.digest => {},
+            _ => anyhow::bail!("legacy OCI location must pin the same manifest digest"),
+        }
+    }
+    if asset.digest.len() != 64 { anyhow::bail!("asset hash must be bare SHA-256 hex"); }
+    orchard_core::oci_asset::hash_hex(&asset.digest)?;
+    if !(asset.url.starts_with("https://") || asset.url.starts_with("http://")) {
+        anyhow::bail!("asset URL must use HTTP or HTTPS");
+    }
+    Ok(EventBuilder::new(Kind::Custom(crate::KIND_ASSET as u16), "")
         .tag(tag("i", &asset.app_id))
         .tag(tag("x", &asset.digest))
         .tag(tag("version", &asset.version))
         .tag(tag("f", &asset.platform))
-        .tag(tag("oci", &asset.location))
-        .tag_maybe(optional_tag("runtime", &asset.runtime));
-    Ok(builder.finalize(keys)?)
+        .tag(tag("m", &asset.mime))
+        .tag(tag("T", orchard_core::oci_asset::PACKAGE))
+        .tag(tag("url", &asset.url))
+        .tag(tag("size", &asset.size.to_string()))
+        .tag(tag("filename", &asset.filename))
+        .tag_maybe(legacy.map(|location| tag("oci", location)))
+        .finalize(keys)?)
 }
 
 pub fn sign_release(keys: &Keys, release: &Release) -> Result<Event> {
-    let builder = EventBuilder::new(
-        Kind::Custom(crate::KIND_RELEASE as u16),
-        release.notes.as_deref().unwrap_or(""),
-    )
-    .tag(tag(
-        "d",
-        &format!("{}@{}@{}", release.app_id, release.version, release.platform),
-    ))
-    .tag(tag("i", &release.app_id))
-    .tag(tag("version", &release.version))
-    .tag(tag("f", &release.platform))
-    .tag(tag("c", &release.channel))
-    .tag(tag("e", &release.asset_id));
+    if release.asset_ids.is_empty() { anyhow::bail!("release requires assets"); }
+    let coordinate = format!("{}:{}:{}", crate::KIND_APP, keys.get_public_key()?, release.app_id);
+    let mut builder = EventBuilder::new(
+        Kind::Custom(crate::KIND_RELEASE as u16), release.notes.as_deref().unwrap_or(""))
+        .tag(tag("d", &format!("{}@{}", release.app_id, release.version)))
+        .tag(tag("a", &coordinate))
+        .tag(tag("i", &release.app_id))
+        .tag(tag("version", &release.version))
+        .tag(tag("c", &release.channel));
+    for platform in &release.platforms { builder = builder.tag(tag("f", platform)); }
+    for id in &release.asset_ids { builder = builder.tag(tag("e", id)); }
     Ok(builder.finalize(keys)?)
 }
 
@@ -160,6 +179,53 @@ pub fn sign_review(keys: &Keys, review: &Review) -> Result<Event> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn transition_tags_only_name_the_same_manifest() {
+        let keys = Keys::generate();
+        let mut asset = Asset {
+            app_id: "com.example.Transition".into(), version: "1".into(),
+            platform: "linux-x86_64".into(), digest: "a".repeat(64),
+            url: format!("https://ghcr.io/v2/example/app/manifests/sha256:{}", "a".repeat(64)),
+            size: 42, filename: "app.manifest.json".into(), mime: orchard_core::oci_asset::MIME.into(),
+        };
+        let legacy = format!("docker://ghcr.io/example/app@sha256:{}", asset.digest);
+        let event = sign_asset_with_legacy_location(&keys, &asset, Some(&legacy)).unwrap();
+        let parts = crate::Parts::parse(&event).unwrap();
+        assert_eq!(parts.tag("oci").as_deref(), Some(legacy.as_str()));
+        assert_eq!(parts.tag("url").as_deref(), Some(asset.url.as_str()));
+        assert_eq!(parts.tag("x").as_deref(), Some(asset.digest.as_str()));
+        assert!(crate::Parts::parse(&sign_asset(&keys, &asset).unwrap()).unwrap().tag("oci").is_none());
+        assert!(sign_asset_with_legacy_location(&keys, &asset,
+            Some(&format!("docker://ghcr.io/example/app@sha256:{}", "b".repeat(64)))).is_err());
+        asset.mime = "application/vnd.oci.image.config.v1+json".into();
+        assert!(sign_asset_with_legacy_location(&keys, &asset, Some(&legacy)).is_err());
+    }
+
+    // Golden contract for v0.2.0 (4d2978a): absorb requires i/version/f,
+    // an installable oci location and an x pin agreeing with that location.
+    // Keep this fixture independent of the current builder and Feed parser.
+    #[test]
+    fn legacy_oci_asset_tags_match_v020_contract() {
+        let keys = Keys::generate();
+        let expected: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/legacy-oci-asset-tags.json"
+        )).unwrap();
+        let hash = "a".repeat(64);
+        let legacy = format!("docker://https://ghcr.io/example/app@sha256:{hash}");
+        let event = sign_asset_with_legacy_location(&keys, &Asset {
+            app_id: "com.example.Transition".into(), version: "1".into(),
+            platform: "linux-x86_64".into(), digest: hash.clone(),
+            url: format!("https://ghcr.io/v2/example/app/manifests/sha256:{hash}"),
+            size: 42, filename: "app.manifest.json".into(),
+            mime: orchard_core::oci_asset::MIME.into(),
+        }, Some(&legacy)).unwrap();
+        event.verify().unwrap();
+        let json: serde_json::Value = serde_json::from_str(&event.as_json()).unwrap();
+        assert_eq!(json["kind"], 3063);
+        assert_eq!(json["content"], "");
+        assert_eq!(json["tags"], expected);
+    }
+
     /// The round-trip rule: a builder's event must absorb on the read
     /// side and project the same fields back.
     #[test]
@@ -191,9 +257,11 @@ mod tests {
                 app_id: "com.example.Hello".into(),
                 version: "1.0.0".into(),
                 platform: "linux-x86_64".into(),
-                digest: format!("sha256:{}", "ab".repeat(32)),
-                location: "oci:/srv/hello".into(),
-                runtime: Some("org.freedesktop.Platform/x86_64/25.08".into()),
+                digest: "ab".repeat(32),
+                url: "https://example.com/hello.oci.json".into(),
+                size: 123,
+                filename: "hello.oci.json".into(),
+                mime: orchard_core::oci_asset::MIME.into(),
             },
         )
         .unwrap();
@@ -202,13 +270,20 @@ mod tests {
             &Release {
                 app_id: "com.example.Hello".into(),
                 version: "1.0.0".into(),
-                platform: "linux-x86_64".into(),
+                platforms: vec!["linux-x86_64".into()],
                 channel: "stable".into(),
                 notes: Some("First.".into()),
-                asset_id: asset.id.to_string(),
+                asset_ids: vec![asset.id.to_string()],
             },
         )
         .unwrap();
+        let parts = crate::Parts::parse(&release).unwrap();
+        assert_eq!(parts.tag("d").as_deref(), Some("com.example.Hello@1.0.0"));
+        assert_eq!(parts.tag("a").unwrap(), format!("32267:{}:com.example.Hello", keys.get_public_key().unwrap()));
+        let asset_parts = crate::Parts::parse(&asset).unwrap();
+        assert_eq!(asset_parts.tag("x").unwrap().len(), 64);
+        assert_eq!(asset_parts.tag("T").as_deref(), Some("flatpak-oci"));
+        assert!(asset_parts.tag("oci").is_none());
         let mut feed = crate::Feed::new();
         for event in [&listing, &asset, &release] {
             feed.absorb(event.clone()).unwrap();
