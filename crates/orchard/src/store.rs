@@ -4018,31 +4018,14 @@ impl StoreRoot {
                                     )
                                     // repo-verified: the forge hosts
                                     // this publisher key (quiet by
-                                    // default, the words on hover)
+                                    // default, the words on hover;
+                                    // the glyph is the repo fact,
+                                    // not the signature check)
                                     .when(row_repo_ok, |row| {
-                                        row.child(
-                                            div()
-                                                .id(SharedString::from(
-                                                    repo_verified_id,
-                                                ))
-                                                .hover(|style| {
-                                                    style.bg(gpui::transparent_black())
-                                                })
-                                                .tooltip(|_window, cx| {
-                                                    cx.new(|_| {
-                                                        TextTooltip(
-                                                            "Repository-verified: the linked repository carries this publisher's signing key"
-                                                                .into(),
-                                                        )
-                                                    })
-                                                    .into()
-                                                })
-                                                .child(ui::icon(
-                                                    "icons/check.svg",
-                                                    13.,
-                                                    ui::risk_color(orchard_core::Risk::Low),
-                                                )),
-                                        )
+                                        row.child(repo_verified_glyph(
+                                            SharedString::from(repo_verified_id),
+                                            13.,
+                                        ))
                                     }),
                             )
                             .child(
@@ -5695,23 +5678,15 @@ impl StoreRoot {
                             .text_color(ui::text_dim())
                             .children(card.date_note.clone().map(|note| div().child(note)))
                             .children(card.repo_ok.then(|| {
-                                // the repo-verified check, same words
-                                // as the rows and the page link
-                                div()
-                                    .id(SharedString::from(format!(
+                                // the repo-verified check, same glyph
+                                // and words as the rows and the page
+                                // link
+                                repo_verified_glyph(
+                                    SharedString::from(format!(
                                         "pub-card-repo-{index}"
-                                    )))
-                                    .hover(|style| style.bg(gpui::transparent_black()))
-                                    .tooltip(|_window, cx| {
-                                        cx.new(|_| {
-                                            TextTooltip(
-                                                "Repository-verified: the linked repository carries this publisher's signing key"
-                                                    .into(),
-                                            )
-                                        })
-                                        .into()
-                                    })
-                                    .child(ui::icon("icons/check.svg", 12., ui::accent()))
+                                    )),
+                                    12.,
+                                )
                             })),
                     ),
             );
@@ -8444,6 +8419,34 @@ fn human_size(bytes: u64) -> String {
 /// One clickable project link row: an icon, the URL, the host's
 /// default handler on click. Homepage and repository share the shape;
 /// `verified` adds the repo-verified check beside the link.
+/// The repository-claim indicator, shared by the cards, the rows and
+/// the page link. Deliberately not the plain check glyph: that one
+/// means "the events carry this publisher's signature", the root of
+/// the install pipeline. The repository claim is a display-layer fact
+/// (the linked repository hosts the key), and a lookalike fork can
+/// host a proof too, so it wears the repo glyph and names its limit
+/// on hover.
+fn repo_verified_glyph(id: SharedString, size: f32) -> impl IntoElement {
+    div()
+        .id(id)
+        .flex_none()
+        .hover(|style| style.bg(gpui::transparent_black()))
+        .tooltip(|_window, cx| {
+            cx.new(|_| {
+                TextTooltip(
+                    "Repository claim checked: the linked repository hosts this publisher's signing key. This checks the claim, not which repository is canonical: a lookalike fork can host a proof too."
+                        .into(),
+                )
+            })
+            .into()
+        })
+        .child(ui::icon(
+            "icons/git.svg",
+            size,
+            ui::risk_color(orchard_core::Risk::Low),
+        ))
+}
+
 fn project_link(
     id: &'static str,
     icon: &'static str,
@@ -8467,26 +8470,10 @@ fn project_link(
         .child(ui::icon(icon, 13., ui::accent()))
         .child(url)
         .when(verified, |link| {
-            link.child(
-                div()
-                    .id(SharedString::from(format!("link-{id}-verified")))
-                    .flex_none()
-                    .hover(|style| style.bg(gpui::transparent_black()))
-                    .tooltip(|_window, cx| {
-                        cx.new(|_| {
-                            TextTooltip(
-                                "Repository-verified: the linked repository carries this publisher's signing key"
-                                    .into(),
-                            )
-                        })
-                        .into()
-                    })
-                    .child(ui::icon(
-                        "icons/check.svg",
-                        13.,
-                        ui::risk_color(orchard_core::Risk::Low),
-                    )),
-            )
+            link.child(repo_verified_glyph(
+                SharedString::from(format!("link-{id}-verified")),
+                13.,
+            ))
         })
 }
 
