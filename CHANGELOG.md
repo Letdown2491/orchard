@@ -1,5 +1,39 @@
 # Changelog
 
+## v0.3.0 (2026-10-21)
+
+- **Releases publish as NIP-82 component assets.** A self-publication now
+  signs a component graph: a config asset, a layer asset per architecture,
+  and a manifest referencing them, each digest-pinned in its own kind 3063
+  event, with the release pointing at the parts. The `T` tag names the
+  installable target (`flatpak-oci` beside the other OCI kinds), so a
+  release can carry several OCI flavors without them competing for one
+  install button. The wire contract is pinned by a golden fixture test.
+- **0.2.0 clients still update in place.** Each manifest asset also carries
+  a legacy registry location pinned to the same digest as the asset's own
+  `x` tag (the publisher enforces the match, the golden test pins the tag
+  set), so the unmodified 0.2.0 reader resolves the new release through its
+  existing OCI install path: coming from 0.2.0, update in place, nothing to
+  do by hand. The recorded trade-off: a third-party publisher adopting the
+  component shape without a legacy location is invisible to 0.2.0 clients,
+  which is accepted for releases that do not need the old chain.
+- **One release per version, not per architecture.** The tag-driven
+  publish previously let per-arch jobs overwrite one release; each runner
+  now uploads its artifact and exports unsigned asset metadata, and one
+  final job verifies the hosted manifests and signs a single release
+  referencing both architectures.
+- **Runtime and permissions move into the verified image config.** They
+  rode unsigned event tags; they now come from the image config bytes,
+  which are hash-pinned in the signed events, so what the pre-flight and
+  the permissions viewer show is the same bytes the runtime will run.
+- **Install gating keys off the signed shape.** Bundle versus image
+  installs are chosen from the release's component assets, a mismatched
+  `flatpak_ref` hard-fails the install, and the remaining unreachable
+  states in the fetch and install paths return errors instead of panics.
+- **From 0.2.0 this update also brings the screenshots feature** (the
+  listing `screenshot` tags of v0.2.1, which was never published), so app
+  pages gain the screenshot strip beside this release's changes.
+
 ## v0.2.1 (2026-10-16)
 
 - **Listings carry screenshots.** The publisher manifest's `[app]`
