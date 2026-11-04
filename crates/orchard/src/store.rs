@@ -18,7 +18,9 @@ use gpui::{
     TextLayout, TextRun, UniformListScrollHandle, Window,
 };
 
-use orchard_core::{oci, permissions, CatalogFile, RemoteChannel, Risk, Source, StoreApp};
+use orchard_core::{
+    oci, permissions, CatalogFile, ChannelPick, RemoteChannel, Risk, Source, StoreApp,
+};
 
 use crate::ui::{self, app_icon, badge, button, Tone};
 
@@ -195,18 +197,20 @@ enum RelayTarget {
 /// `run_confirm` executes whichever variant the user confirmed.
 #[derive(Clone, Debug, PartialEq)]
 enum Confirm {
-    /// Install (or verify-and-install) a publisher app.
+    /// Install (or verify-and-install) a publisher app, at a channel
+    /// branch when the dropdown picked one.
     Install {
         app_id: String,
         publisher: Option<String>,
+        branch: Option<String>,
     },
     /// Update an installed app to the catalog's release.
     Update {
         app_id: String,
         publisher: Option<String>,
     },
-    /// Uninstall an installed app.
-    Remove { app_id: String },
+    /// Uninstall an installed app, at its deployed branch.
+    Remove { app_id: String, branch: Option<String> },
     /// Interrupt the running job.
     Cancel { job_key: String },
     /// Clear a settings cache: `images` or `events`.
@@ -219,6 +223,8 @@ enum Confirm {
 pub struct InstalledInfo {
     /// Deploy version from `flatpak list`, e.g. `1.2.95.453`.
     pub version: Option<String>,
+    /// Deploy branch from `flatpak list`: the channel deployment.
+    pub branch: Option<String>,
     /// Human size from `flatpak info`, e.g. `1.0 GB`.
     pub size: Option<String>,
     /// Sandbox metadata ini read from the deploy, for the permissions view.
@@ -231,7 +237,9 @@ pub struct InstalledInfo {
 pub struct StoreRoot {
     pub(crate) focus_handle: FocusHandle,
     apps: Vec<StoreApp>,
-    installed: HashMap<String, InstalledInfo>,
+    /// app id -> deployments, one per branch: parallel channel
+    /// deploys are first-class, each its own row fact here.
+    installed: HashMap<String, Vec<InstalledInfo>>,
     search: String,
     filter: Filter,
     selected: Option<String>,
@@ -291,6 +299,11 @@ pub struct StoreRoot {
     /// app id -> verified manifest digest (publisher channel,
     /// post-verify).
     verified: HashMap<String, String>,
+    /// The install-error modal is open: the status bar line is short
+    /// and transient; the modal carries the full text, copyable.
+    error_modal: bool,
+    /// The branch dropdown is open, anchored at the click point.
+    branch_menu: Option<gpui::Point<gpui::Pixels>>,
     /// Verified digest pins on disk (location|pin -> served digest): a
     /// checked pin is a fact that cannot rot, so verdicts survive
     /// restarts and never re-contact the registry.
@@ -455,6 +468,8 @@ impl StoreRoot {
             focus_handle: cx.focus_handle(),
             apps: Vec::new(),
             installed: HashMap::new(),
+            error_modal: false,
+            branch_menu: None,
             search: String::new(),
             filter: Self::initial_filter(&settings),
             selected: None,
@@ -801,7 +816,7 @@ impl StoreRoot {
                         && app.remote.as_deref() == Some(name.as_str())
                 }
                 Filter::Publisher => app.source == Source::Publisher,
-                Filter::Installed => self.installed.contains_key(&app.app_id),
+                Filter::Installed => self.is_installed(&app.app_id),
             })
             .filter(|(_, app)| match &self.category {
                 Some(want) => app.categories.iter().any(|c| c == want),
@@ -885,6 +900,28 @@ impl StoreRoot {
         .detach();
     }
 
+    /// True when any deployment of the app id exists.
+    fn is_installed(&self, app_id: &str) -> bool {
+        self.installed.contains_key(app_id)
+    }
+
+    /// The deployment an action aims at: the branch's own, else the
+    /// single one, else the first (a lone stable deploy).
+    fn deployment(&self, app_id: &str, branch: Option<&str>) -> Option<&InstalledInfo> {
+        let deployments = self.installed.get(app_id)?;
+        deployments
+            .iter()
+            .find(|info| branch.is_some_and(|b| info.branch.as_deref() == Some(b)))
+            .or_else(|| {
+                if deployments.len() == 1 || branch.is_none() {
+                    deployments.first()
+                } else {
+                    None
+                }
+            })
+            .or_else(|| deployments.first())
+    }
+
     /// Select an app (keyboard) without opening the page. Images are
     /// fetched when the page opens, not per arrow press.
     fn set_selected(&mut self, app_id: &str, cx: &mut Context<Self>) {
@@ -951,7 +988,7 @@ impl StoreRoot {
         // publisher apps the artifact itself is read (digest check plus
         // sandbox labels in one manifest fetch)
         let source = self.find_app(app_id).map(|a| a.source);
-        let not_installed = !self.installed.contains_key(app_id);
+        let not_installed = !self.is_installed(app_id);
         match source {
             Some(Source::Reviewed) if not_installed => {
                 let channel = self
@@ -2312,7 +2349,7 @@ impl StoreRoot {
 
     // ----- actions -----
 
-    fn install(&mut self, app_id: &str, cx: &mut Context<Self>) {
+    fn install(&mut self, app_id: &str, branch: Option<&str>, cx: &mut Context<Self>) {
         self.disarm_confirms();
         // the selection's publisher names the twin: two publishers of
         // one app id install from different artifacts
@@ -2329,6 +2366,23 @@ impl StoreRoot {
         };
         if self.jobs.contains_key(app_id) || self.refuse_if_busy() {
             return;
+        }
+        // a dropdown pick installs that channel's release, not the
+        // row's default: the pick's pin and location replace the
+        // top-level ones
+        let mut app = app;
+        if let Some(branch) = branch
+            && app.branch.as_deref() != Some(branch)
+        {
+            let Some(pick) = app.channels.iter().find(|pick| pick.channel == branch) else {
+                return;
+            };
+            app.version = (!pick.version.is_empty()).then(|| pick.version.clone());
+            app.location = Some(pick.location.clone());
+            app.pinned_digest = pick.digest.clone();
+            app.oci_assets = pick.oci_assets.clone();
+            app.branch = Some(branch.to_string());
+            app.notes = pick.notes.clone();
         }
         match app.source {
             Source::Reviewed => {
@@ -2373,7 +2427,11 @@ impl StoreRoot {
             Source::Reviewed => {
                 self.jobs.insert(app.app_id.clone(), Job::new(JobState::Updating));
                 let channel = self.channel_for(app.remote.as_deref());
-                let cmd = orchard_flatpak::update_ref(channel_scope(&channel), &app.app_id);
+                let cmd = orchard_flatpak::update_ref(
+                    channel_scope(&channel),
+                    &app.app_id,
+                    app.branch.as_deref(),
+                );
                 self.run_job(cmd, &app.app_id, "Update", &channel.remote, cx);
             }
             Source::Publisher => self.verify_then_install(app, true, cx),
@@ -2661,12 +2719,21 @@ impl StoreRoot {
                         if app.metadata.is_none() {
                             app.metadata = metadata;
                         }
-                        // The catalog ref must match what the image labels
-                        // claim; flatpak enforces this again at pull time.
-                        // Flatpak refs deliberately use stable, independently of
-                        // the NIP-82 release channel, matching the publisher.
-                        let expected_ref = format!("app/{}/{}/stable", app.app_id, orchard_core::host_ref_arch());
-                        if flatpak_ref.as_deref() != Some(expected_ref.as_str()) {
+                        // The catalog must name the app and arch the
+                        // image labels claim; flatpak enforces this
+                        // again at pull time. The branch is not
+                        // compared: a channel's branch is the label's
+                        // own business, and the client shows the
+                        // channel tag it deployed from.
+                        let expected_ref = format!(
+                            "app/{}/{}/",
+                            app.app_id,
+                            orchard_core::host_ref_arch()
+                        );
+                        if !flatpak_ref
+                            .as_deref()
+                            .is_some_and(|r| r.starts_with(&expected_ref))
+                        {
                             this.jobs.remove(&app.app_id);
                             this.fail(format!("artifact does not contain {expected_ref}"));
                             cx.notify();
@@ -2756,6 +2823,7 @@ impl StoreRoot {
                                         orchard_flatpak::uninstall(
                                             orchard_flatpak::Scope::User,
                                             &app.app_id,
+                                            app.branch.as_deref(),
                                         ),
                                         &app.app_id,
                                         install_label,
@@ -2782,6 +2850,7 @@ impl StoreRoot {
                                     orchard_flatpak::uninstall(
                                         orchard_flatpak::Scope::User,
                                         &app.app_id,
+                                        app.branch.as_deref(),
                                     ),
                                     &app.app_id,
                                     install_label,
@@ -2842,31 +2911,34 @@ impl StoreRoot {
             .map(|key| key.as_str())
     }
 
-    fn uninstall(&mut self, app_id: &str, cx: &mut Context<Self>) {
+    fn uninstall(&mut self, app_id: &str, branch: Option<&str>, cx: &mut Context<Self>) {
         self.disarm_confirms();
         if self.jobs.contains_key(app_id) || self.refuse_if_busy() {
             return;
         }
         self.record_installed_from(app_id, None);
-        // remove from the scope the app deployed to: publisher-channel
-        // apps are user installs, reviewed (Flathub) apps system installs
-        let scope = if self
-            .installed
-            .get(app_id)
-            .is_some_and(|info| info.user_scope)
-        {
+        // remove from the scope the deploy landed in, at its branch:
+        // publisher-channel apps are user installs, reviewed (Flathub)
+        // apps system installs
+        let info = self.deployment(app_id, branch);
+        let scope = if info.is_some_and(|info| info.user_scope) {
             orchard_flatpak::Scope::User
         } else {
             orchard_flatpak::Scope::System
         };
-        let cmd = orchard_flatpak::uninstall(scope, app_id);
+        let cmd = orchard_flatpak::uninstall(scope, app_id, branch);
         self.jobs
             .insert(app_id.to_string(), Job::new(JobState::Removing));
         self.run_job(cmd, app_id, "Remove", "", cx);
     }
 
-    fn open(&mut self, app_id: &str, cx: &mut Context<Self>) {
-        if orchard_flatpak::run(app_id).spawn().is_err() {
+    fn open(&mut self, app_id: &str, branch: Option<&str>, cx: &mut Context<Self>) {
+        // no branch named: launch the first deployment (rows do not
+        // track which channel the user deployed)
+        let branch = branch
+            .map(str::to_string)
+            .or_else(|| self.installed.get(app_id).and_then(|d| d.first().and_then(|i| i.branch.clone())));
+        if orchard_flatpak::run(app_id, branch.as_deref()).spawn().is_err() {
             self.fail(format!("failed to launch {app_id}"));
             cx.notify();
         }
@@ -3176,6 +3248,7 @@ impl StoreRoot {
                                     .is_some_and(|app| {
                                         installed
                                             .get(&app_id)
+                                            .and_then(|deployments| deployments.first())
                                             .is_some_and(|info| {
                                                 !update_available(app, info)
                                             })
@@ -3473,10 +3546,22 @@ impl StoreRoot {
                 self.delete_text(false);
             }
             "escape" => {
-                // back out one level: confirm modal, lightbox, page,
-                // then selection, then text, then row selection
+                // back out one level: confirm modal, dropdowns, error
+                // modal, lightbox, page, then selection, then text,
+                // then row selection
                 if self.confirm.is_some() {
                     self.confirm = None;
+                } else if self.branch_menu.is_some()
+                    || self.sort_menu.is_some()
+                    || self.channel_menu.is_some()
+                    || self.account_menu.is_some()
+                {
+                    self.branch_menu = None;
+                    self.sort_menu = None;
+                    self.channel_menu = None;
+                    self.account_menu = None;
+                } else if self.error_modal {
+                    self.error_modal = false;
                 } else if self.lightbox.is_some() {
                     self.lightbox = None;
                 } else if self.collection_view.is_some() {
@@ -4006,10 +4091,9 @@ impl StoreRoot {
                 let repo_verified_id = format!("{row_id}-repo-verified");
                 let is_selected = selected == Some(app.app_id.as_str())
                     && self.selected_publisher.as_deref() == app.publisher.as_deref();
-                let is_installed = self.installed.contains_key(&app.app_id);
+                let is_installed = self.is_installed(&app.app_id);
                 let outdated = self
-                    .installed
-                    .get(app.app_id.as_str())
+                    .deployment(&app.app_id, app.branch.as_deref())
                     .is_some_and(|info| update_available(app, info));
                 let job = self.jobs.get(&app.app_id).map(|job| job.label().to_string());
                 let verified_digest = self.verified.get(&row_key).cloned();
@@ -4078,6 +4162,19 @@ impl StoreRoot {
                                         Source::Reviewed => badge(&self.reviewed_badge(app), ui::text_dim()),
                                         Source::Publisher => badge("Orchard", ui::accent()),
                                     })
+                                    // channel flag: the row's default pick
+                                    // names its branch when that is not
+                                    // stable; stable stays unflagged
+                                    .when(
+                                        app.source == Source::Publisher
+                                            && app.branch.as_deref().is_some_and(|b| b != "stable"),
+                                        |row| {
+                                            row.child(badge(
+                                                app.branch.as_deref().unwrap_or_default(),
+                                                ui::text_dim(),
+                                            ))
+                                        },
+                                    )
                                     // digest ok: this client has checked
                                     // the artifact against the signed
                                     // pin. Hidden in the Orchard view:
@@ -4227,7 +4324,7 @@ impl StoreRoot {
                                 )
                                 .on_click(cx.listener(move |this, _e: &ClickEvent, _w, cx| {
                                     cx.stop_propagation();
-                                    this.open(action_id.as_str(), cx);
+                                    this.open(action_id.as_str(), None, cx);
                                 })))
                                 .when(outdated, |slot| {
                                     let update_id = row_update_id.clone();
@@ -4295,6 +4392,7 @@ impl StoreRoot {
                                         this.confirm = Some(Confirm::Install {
                                             app_id: action_id.clone(),
                                             publisher: install_publisher.clone(),
+                                            branch: None,
                                         });
                                         cx.notify();
                                     })),
@@ -4316,7 +4414,7 @@ impl StoreRoot {
         // the page's bookkeeping key: the selected twin's publisher
         // names which digest, sizes, and verify error belong here
         let page_key = app_key(&app_id, app.publisher.as_deref());
-        let installed = self.installed.contains_key(&app_id);
+        let installed = self.is_installed(&app_id);
         let job = self.jobs.get(&app_id).cloned();
         let verified = self.verified.get(&page_key).cloned();
 
@@ -4327,8 +4425,7 @@ impl StoreRoot {
             .metadata
             .clone()
             .or_else(|| {
-                self.installed
-                    .get(&app_id)
+                self.deployment(&app_id, None)
                     .and_then(|info| info.metadata.clone())
             })
             .or_else(|| self.remote_metadata.get(&page_key).cloned());
@@ -4528,8 +4625,7 @@ impl StoreRoot {
         // fact rides above the content as a banner, a fact not a
         // verdict (the Update button is amber for every update)
         let update_changed = self
-            .installed
-            .get(&app_id)
+            .deployment(&app_id, app.branch.as_deref())
             .is_some_and(|info| update_available(&app, info))
             && self
                 .installed_from(app_id.as_str())
@@ -4571,18 +4667,24 @@ impl StoreRoot {
                     let mut buttons: Vec<gpui::AnyElement> = Vec::new();
                     if installed {
                         let open_id = app_id.clone();
+                        let open_branch = self
+                            .deployment(&app_id, app.branch.as_deref())
+                            .and_then(|info| info.branch.clone());
                         buttons.push(
                             button("btn-open", Some("icons/play.svg"), "Open", Tone::Accent)
                                 .on_click(cx.listener(
                                     move |this, _e: &ClickEvent, _w, cx| {
-                                        this.open(open_id.as_str(), cx);
+                                        this.open(
+                                            open_id.as_str(),
+                                            open_branch.as_deref(),
+                                            cx,
+                                        );
                                     },
                                 ))
                                 .into_any_element(),
                         );
                         if self
-                            .installed
-                            .get(&app_id)
+                            .deployment(&app_id, app.branch.as_deref())
                             .is_some_and(|info| update_available(&app, info))
                         {
                             let update_id = app_id.clone();
@@ -4617,17 +4719,60 @@ impl StoreRoot {
                         } else {
                             "Install"
                         };
+                        // other channels with something to install:
+                        // entries whose branch is already deployed at
+                        // the same version or newer stay hidden
+                        let other_picks: Vec<ChannelPick> = app
+                            .channels
+                            .iter()
+                            .filter(|pick| {
+                                self.deployment(&app_id, Some(&pick.channel))
+                                    .map_or(true, |info| {
+                                        version_outdated(
+                                            info.version.as_deref().unwrap_or(""),
+                                            &pick.version,
+                                        )
+                                    })
+                            })
+                            .cloned()
+                            .collect();
+                        let has_menu = !other_picks.is_empty();
                         buttons.push(
                             button("btn-install", Some("icons/plus.svg"), label, Tone::Accent)
                                 .on_click(cx.listener(move |this, _e: &ClickEvent, _w, cx| {
                                     this.confirm = Some(Confirm::Install {
                                         app_id: install_id.clone(),
                                         publisher: install_publisher.clone(),
+                                        branch: None,
                                     });
                                     cx.notify();
                                 }))
                                 .into_any_element(),
                         );
+                        if has_menu {
+                            buttons.push(
+                                ui::small_button(
+                                    format!("btn-branch-{app_id}"),
+                                    Some("icons/chevron_down.svg"),
+                                    "",
+                                    Tone::Accent,
+                                )
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, event: &MouseDownEvent, _w, cx| {
+                                        let open = this.branch_menu.is_some();
+                                        this.branch_menu = if open {
+                                            None
+                                        } else {
+                                            Some(event.position)
+                                        };
+                                        cx.stop_propagation();
+                                        cx.notify();
+                                    }),
+                                )
+                                .into_any_element(),
+                            );
+                        }
                     }
                     div().flex().items_center().gap_2().children(buttons).into_any_element()
                 }
@@ -4698,7 +4843,7 @@ impl StoreRoot {
                                         div().child(format!("· updated {date}"))
                                     }
                                 }))
-                                .children(match self.installed.get(&app_id) {
+                                .children(match self.deployment(&app_id, app.branch.as_deref()) {
                                     // installed: the size on disk; not
                                     // installed: what the remote would
                                     // download (or occupy once it lands)
@@ -4908,9 +5053,14 @@ impl StoreRoot {
                     )
                     .on_click(cx.listener({
                         let remove_id = app_id.clone();
+                        let remove_branch = self
+                            .deployment(&app_id, app.branch.as_deref())
+                            .and_then(|info| info.branch.clone());
                         move |this, _e: &ClickEvent, _w, cx| {
-                            this.confirm =
-                                Some(Confirm::Remove { app_id: remove_id.clone() });
+                            this.confirm = Some(Confirm::Remove {
+                                app_id: remove_id.clone(),
+                                branch: remove_branch.clone(),
+                            });
                             cx.notify();
                         }
                     })),
@@ -6808,9 +6958,16 @@ impl Render for StoreRoot {
                     }))
                     .children(self.error.clone().map(|error| {
                         div()
+                            .id("status-error")
                             .text_color(ui::urgent())
                             .overflow_hidden()
                             .whitespace_nowrap()
+                            .cursor_pointer()
+                            .hover(|style| style.underline())
+                            .on_click(cx.listener(|this, _e: &ClickEvent, _w, cx| {
+                                this.error_modal = true;
+                                cx.notify();
+                            }))
                             .child(format!("⚠ {error}"))
                     })),
             )
@@ -6896,11 +7053,17 @@ impl StoreRoot {
         if self.account_menu.is_some() {
             layers = layers.child(self.render_account_menu(cx));
         }
+        if self.branch_menu.is_some() {
+            layers = layers.child(self.render_branch_menu(cx));
+        }
         if self.signin_modal {
             layers = layers.child(self.render_signin_modal(font, cx));
         }
         if self.about_modal {
             layers = layers.child(self.render_about_modal(cx));
+        }
+        if self.error_modal {
+            layers = layers.child(self.render_error_modal(cx));
         }
         layers.into_any_element()
     }
@@ -6921,7 +7084,7 @@ impl StoreRoot {
             Confirm::Install { app_id, publisher } | Confirm::Update { app_id, publisher } => {
                 (app_id.clone(), publisher.clone())
             }
-            Confirm::Remove { app_id } => (app_id.clone(), None),
+            Confirm::Remove { app_id, .. } => (app_id.clone(), None),
             _ => (String::new(), None),
         };
         let app = self
@@ -6942,8 +7105,7 @@ impl StoreRoot {
             .as_ref()
             .and_then(|a| a.metadata.clone())
             .or_else(|| {
-                self.installed
-                    .get(&app_id)
+                self.deployment(&app_id, None)
                     .and_then(|info| info.metadata.clone())
             })
             .or_else(|| {
@@ -7004,8 +7166,7 @@ impl StoreRoot {
                 "Cancel",
                 "Install",
                 Tone::Accent,
-            ),
-            Confirm::Update { app_id, publisher } => {
+            ),            Confirm::Update { app_id, publisher } => {
                 // the row badges are gone, so the modal is where a
                 // launch from the list still names a key change
                 let key_note = self
@@ -7204,15 +7365,15 @@ impl StoreRoot {
     /// the confirm down themselves; this only routes.
     fn run_confirm(&mut self, confirm: Confirm, cx: &mut Context<Self>) {
         match confirm {
-            Confirm::Install { app_id, publisher } => {
+            Confirm::Install { app_id, publisher, branch } => {
                 self.selected_publisher = publisher;
-                self.install(&app_id, cx);
+                self.install(&app_id, branch.as_deref(), cx);
             }
             Confirm::Update { app_id, publisher } => {
                 self.selected_publisher = publisher;
                 self.update(&app_id, cx);
             }
-            Confirm::Remove { app_id } => self.uninstall(&app_id, cx),
+            Confirm::Remove { app_id, branch } => self.uninstall(&app_id, branch.as_deref(), cx),
             Confirm::Cancel { job_key } => self.cancel_job(&job_key, cx),
             Confirm::Clear { target } => match target {
                 "images" => self.clear_image_cache(cx),
@@ -7230,6 +7391,7 @@ impl StoreRoot {
         if self.channel_menu.is_none()
             && self.account_menu.is_none()
             && self.sort_menu.is_none()
+            && self.branch_menu.is_none()
         {
             return None;
         }
@@ -7244,6 +7406,7 @@ impl StoreRoot {
                         this.channel_menu = None;
                         this.account_menu = None;
                         this.sort_menu = None;
+                        this.branch_menu = None;
                         cx.notify();
                     }),
                 )
@@ -7251,10 +7414,98 @@ impl StoreRoot {
         )
     }
 
+    /// The branch dropdown: the detail page's other channels, each
+    /// with its version. A press arms the install confirm for that
+    /// channel's branch. Same anchored-panel machinery as the sort
+    /// menu.
+    fn render_branch_menu(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let anchor = self.branch_menu.unwrap_or_default();
+        let left = (anchor.x - px(60.)).max(px(8.));
+        // the page's twin, same resolution the page itself used
+        let app = self
+            .selected
+            .as_deref()
+            .and_then(|app_id| {
+                self.apps
+                    .iter()
+                    .find(|a| {
+                        a.app_id == app_id
+                            && a.publisher.as_deref() == self.selected_publisher.as_deref()
+                    })
+            })
+            .cloned();
+        let app_id = app
+            .as_ref()
+            .map(|a| a.app_id.clone())
+            .unwrap_or_default();
+        let publisher = app.as_ref().and_then(|a| a.publisher.clone());
+        let picks: Vec<ChannelPick> = app
+            .map(|app| {
+                app.channels
+                    .iter()
+                    .filter(|pick| {
+                        self.deployment(&app.app_id, Some(&pick.channel))
+                            .map_or(true, |info| {
+                                version_outdated(
+                                    info.version.as_deref().unwrap_or(""),
+                                    &pick.version,
+                                )
+                            })
+                    })
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+        div()
+            .absolute()
+            .left(left)
+            .top(anchor.y + px(6.))
+            .w(px(200.))
+            .flex()
+            .flex_col()
+            .rounded_sm()
+            .border_1()
+            .border_color(ui::divider())
+            .bg(ui::panel())
+            .py_1()
+            .on_mouse_down(
+                MouseButton::Left,
+                |_e: &MouseDownEvent, _w, cx: &mut gpui::App| cx.stop_propagation(),
+            )
+            .children(picks.into_iter().map(|pick| {
+                div()
+                    .id(SharedString::from(format!("branch-item-{}", pick.channel)))
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .px_3()
+                    .py_1()
+                    .cursor_pointer()
+                    .text_size(px(ui::TEXT_SIZE))
+                    .text_color(ui::text())
+                    .hover(|style| style.bg(ui::surface()))
+                    .on_click(cx.listener(move |this, _e: &ClickEvent, _w, cx| {
+                        this.branch_menu = None;
+                        this.confirm = Some(Confirm::Install {
+                            app_id: app_id.clone(),
+                            publisher: publisher.clone(),
+                            branch: Some(pick.channel.clone()),
+                        });
+                        cx.notify();
+                    }))
+                    .child(pick.channel.clone())
+                    .child(
+                        div()
+                            .text_color(ui::text_dim())
+                            .child(pick.version.clone()),
+                    )
+            }))
+            .into_any_element()
+    }
+
     /// The sort dropdown: the list order options with the active one
     /// marked. Same machinery as the channel menu: the panel stops
-    /// mouse down so its clicks survive the behind-everything overlay.
-    fn render_sort_menu(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
+    /// mouse down so its clicks survive the behind-everything overlay.    fn render_sort_menu(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let anchor = self.sort_menu.unwrap_or_default();
         let left = (anchor.x - px(60.)).max(px(8.));
         div()
@@ -8212,6 +8463,87 @@ impl StoreRoot {
                                     cx.open_url("https://github.com/Letdown2491/orchard");
                                 }))
                                 .child("Source repository"),
+                        ),
+                ),
+            )
+            .into_any_element()
+    }
+
+    /// The install-error modal: the status bar line is short and
+    /// transient, this one carries the full text flatpak or the
+    /// verifier produced, selectable and copyable for a bug report.
+    fn render_error_modal(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let error = self.error.clone().unwrap_or_default();
+        let copy_text = error.clone();
+        div()
+            .absolute()
+            .inset_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(
+                div()
+                    .id("error-modal-backdrop")
+                    .absolute()
+                    .inset_0()
+                    .bg(gpui::rgba(0x000000B3))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _e: &MouseDownEvent, _w, cx| {
+                            this.error_modal = false;
+                            cx.stop_propagation();
+                            cx.notify();
+                        }),
+                    ),
+            )
+            .child(
+                div().on_mouse_down(
+                    MouseButton::Left,
+                    |_e: &MouseDownEvent, _w, cx: &mut gpui::App| cx.stop_propagation(),
+                ).child(
+                    div()
+                        .relative()
+                        .w(px(560.))
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(ui::divider())
+                        .bg(ui::panel())
+                        .p_4()
+                        .child(
+                            div()
+                                .text_size(px(ui::TEXT_SIZE_EMPHASIS))
+                                .font_weight(gpui::FontWeight::MEDIUM)
+                                .text_color(ui::risk_color(Risk::High))
+                                .child("Install error"),
+                        )
+                        .child(
+                            div()
+                                .max_h(px(320.))
+                                .overflow_y_scroll()
+                                .text_size(px(ui::TEXT_SIZE))
+                                .text_color(ui::text())
+                                .child(error),
+                        )
+                        .child(
+                            div().flex().justify_end().child(
+                                ui::small_button(
+                                    "error-copy",
+                                    None,
+                                    "Copy",
+                                    Tone::Quiet,
+                                )
+                                .on_click(cx.listener(move |this, _e: &ClickEvent, _w, cx| {
+                                    cx.write_to_clipboard(gpui::ClipboardItem::new_new_string(
+                                        copy_text.clone(),
+                                    ));
+                                    this.error_modal = false;
+                                    this.note("Error text copied.".to_string());
+                                    cx.notify();
+                                })),
+                            ),
                         ),
                 ),
             )
@@ -9514,37 +9846,48 @@ fn connect_relay() -> String {
     }
 }
 
-/// Parse `flatpak list --app --columns=application,version,origin,installation`.
-fn list_installed() -> HashMap<String, InstalledInfo> {
+/// Parse `flatpak list --app --columns=application,version,branch,origin,installation`.
+fn list_installed() -> HashMap<String, Vec<InstalledInfo>> {
     let Ok(output) = orchard_flatpak::list_installed().output() else {
         return HashMap::new();
     };
     let text = String::from_utf8_lossy(&output.stdout);
-    text.lines()
-        .filter_map(|line| {
-            let mut fields = line.split('\t');
-            let app_id = fields.next()?.trim().to_string();
-            if app_id.is_empty() {
-                return None;
-            }
-            let version = fields
-                .next()
-                .map(|f| f.trim().to_string())
-                .filter(|version| !version.is_empty() && version != "—");
-            let _origin = fields.next().map(|f| f.trim().to_string());
-            // the installation column: "user" or "system"
-            let user_scope = fields.next().is_some_and(|f| f.trim() == "user");
-            Some((
-                app_id.clone(),
-                InstalledInfo {
-                    version,
-                    size: installed_size(&app_id, user_scope),
-                    metadata: orchard_flatpak::installed_metadata(&app_id),
-                    user_scope,
-                },
-            ))
-        })
-        .collect()
+    let mut map: HashMap<String, Vec<InstalledInfo>> = HashMap::new();
+    for line in text.lines() {
+        let mut fields = line.split('\t');
+        let app_id = match fields.next().map(str::trim) {
+            Some(app_id) if !app_id.is_empty() => app_id.to_string(),
+            _ => continue,
+        };
+        let version = fields
+            .next()
+            .map(|f| f.trim().to_string())
+            .filter(|version| !version.is_empty() && version != "—");
+        // the branch column: the channel deployment
+        let branch = fields
+            .next()
+            .map(|f| f.trim().to_string())
+            .filter(|branch| !branch.is_empty() && branch != "-");
+        let _origin = fields.next().map(|f| f.trim().to_string());
+        // the installation column: "user" or "system"
+        let user_scope = fields.next().is_some_and(|f| f.trim() == "user");
+        map.entry(app_id).or_default().push(InstalledInfo {
+            branch,
+            version,
+            size: None,
+            metadata: None,
+            user_scope,
+        });
+    }
+    // size and metadata read flatpak per deploy: cheap enough at
+    // catalog scale, and the page and rows render from the cache
+    for (app_id, deployments) in map.iter_mut() {
+        for info in deployments.iter_mut() {
+            info.size = installed_size(app_id, info.user_scope);
+            info.metadata = orchard_flatpak::installed_metadata(app_id);
+        }
+    }
+    map
 }
 
 /// The "Installed Size" line of `flatpak info`, e.g. `1.0 GB`. None when
@@ -9594,9 +9937,15 @@ fn version_outdated(installed: &str, available: &str) -> bool {
     }
 }
 
-/// Update-available detection for one app: both versions must be
-/// known and the remote's strictly newer by the numeric rule.
+/// Update-available detection for one app: the deployed branch must
+/// match the row's channel (same-branch updates only), both versions
+/// must be known, and the remote's strictly newer by the numeric rule.
 fn update_available(app: &StoreApp, installed: &InstalledInfo) -> bool {
+    if app.branch.as_deref().unwrap_or("stable")
+        != installed.branch.as_deref().unwrap_or("stable")
+    {
+        return false;
+    }
     match (&app.version, &installed.version) {
         (Some(available), Some(installed)) => version_outdated(installed, available),
         _ => false,
@@ -9801,6 +10150,8 @@ mod tests {
             version: "1.0.0".into(),
             platforms: vec!["linux-x86_64".into()],
             flatpak_ref: "app/com.example.Hello/x86_64/stable".into(),
+            branch: "stable".into(),
+            channels: Vec::new(),
             location: "oci:/srv/hello".into(),
             digest: Some("sha256:aa".into()),
             oci_assets: None,
@@ -9917,6 +10268,8 @@ mod tests {
             version: "1.0.0".into(),
             platforms: vec!["linux-x86_64".into()],
             flatpak_ref: "app/com.example.Hello/x86_64/stable".into(),
+            branch: "stable".into(),
+            channels: Vec::new(),
             location: "oci:/srv/hello".into(),
             digest: Some("sha256:aa".into()),
             oci_assets: None,

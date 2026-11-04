@@ -44,6 +44,10 @@ pub struct ReleaseMeta {
     pub version: String,
     #[serde(default = "default_channel")]
     pub channel: String,
+    /// The flatpak branch the artifact deploys at. Defaults to the
+    /// channel: `stable` and `main` both mean the stable branch.
+    #[serde(default)]
+    pub branch: Option<String>,
     /// Flatpak arch tag, e.g. `linux-x86_64`. The build target and
     /// the identity of the asset and release this run signs. The
     /// `--arch` flag overrides it for CI matrix legs.
@@ -87,6 +91,16 @@ fn default_channel() -> String {
     "stable".into()
 }
 
+/// The canonical deploy branch of a channel or branch name: `stable`
+/// and `main` (and no name) mean the stable branch; anything else
+/// names its own branch.
+pub fn canonical_branch(name: Option<&str>) -> String {
+    match name {
+        None | Some("stable") | Some("main") => "stable".into(),
+        Some(other) => other.to_string(),
+    }
+}
+
 fn default_arch() -> String {
     "linux-x86_64".into()
 }
@@ -114,6 +128,17 @@ impl Manifest {
             .unwrap_or(&self.release.arch)
             .to_string()
     }
+
+    /// The flatpak branch this run's artifact deploys at: the declared
+    /// branch, else the channel's canonical branch.
+    pub fn deploy_branch(&self) -> String {
+        canonical_branch(
+            self.release
+                .branch
+                .as_deref()
+                .or(Some(self.release.channel.as_str())),
+        )
+    }
 }
 
 /// Load and validate a manifest. Paths inside resolve relative to the
@@ -130,6 +155,19 @@ pub fn load(path: &Path) -> Result<Manifest> {
     }
     if manifest.release.version.is_empty() {
         bail!("manifest: release.version is required");
+    }
+    // tag and label must agree: the release channel is what the client
+    // shows and the flatpak branch is what it deploys, so a declared
+    // branch that contradicts the channel fails before anything is
+    // built or pushed
+    if let Some(branch) = &manifest.release.branch {
+        if canonical_branch(Some(branch)) != canonical_branch(Some(&manifest.release.channel)) {
+            bail!(
+                "manifest: release.branch {:?} does not match release.channel {:?}",
+                branch,
+                manifest.release.channel
+            );
+        }
     }
     // resolve the description file and the artifact tree now, so later
     // stages can treat them as plain paths

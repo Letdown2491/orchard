@@ -46,6 +46,7 @@ pub fn build(
     app_id: &str,
     version: &str,
     ref_arch: &str,
+    branch: &str,
     body: Option<&str>,
 ) -> Result<Built> {
     let metadata_bytes = std::fs::read(tree.join("metadata"))
@@ -60,7 +61,7 @@ pub fn build(
     let installed_size = tree_size(tree)?;
     let download_size = gz_bytes.len() as u64;
 
-    let flatpak_ref = format!("app/{app_id}/{ref_arch}/stable");
+    let flatpak_ref = format!("app/{app_id}/{ref_arch}/{branch}");
     let config = serde_json::json!({
         "architecture": arch_to_docker(ref_arch),
         "config": { "Labels": {

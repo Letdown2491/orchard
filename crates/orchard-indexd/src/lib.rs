@@ -850,6 +850,8 @@ mod tests {
                 version: "1.0.0".into(),
                 platforms: Vec::new(),
                 flatpak_ref: "app/com.orchard.Hello/x86_64/stable".into(),
+                branch: "stable".into(),
+                channels: Vec::new(),
                 location: "oci:/tmp/demo".into(),
                 digest: Some("sha256:00".into()),
                 oci_assets: None,

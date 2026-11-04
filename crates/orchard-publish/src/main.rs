@@ -96,6 +96,11 @@ fn run() -> Result<()> {
             manifest.release.version = version.trim().into();
         }
     }
+    if let Ok(branch) = std::env::var("ORCHARD_PUBLISH_BRANCH") {
+        if !branch.trim().is_empty() {
+            manifest.release.branch = Some(branch.trim().into());
+        }
+    }
     if let Some(arch) = &args.arch {
         manifest.release.arch = arch.clone();
     }
@@ -127,6 +132,7 @@ fn run() -> Result<()> {
             app_id,
             version,
             &manifest.ref_arch(),
+            &manifest.deploy_branch(),
             manifest.release.notes.as_deref(),
         )?;
         eprintln!(
@@ -144,6 +150,7 @@ fn run() -> Result<()> {
             app_id,
             version,
             &manifest.release.arch,
+            &manifest.deploy_branch(),
             args.manifest_url.clone(),
         )?;
         eprintln!("prepared {}", path.display());

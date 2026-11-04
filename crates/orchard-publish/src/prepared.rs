@@ -13,6 +13,9 @@ pub struct Prepared {
     pub app_id: String,
     pub version: String,
     pub platform: String,
+    /// The flatpak branch the artifact's ref label names.
+    #[serde(default = "default_branch")]
+    pub branch: String,
     pub package: String,
     pub mime: String,
     pub filename: String,
@@ -43,19 +46,25 @@ impl Prepared {
     }
 }
 
+/// Prepared assets from before channels existed are stable-branch builds.
+fn default_branch() -> String {
+    "stable".into()
+}
+
 pub fn write(
     layout: &Path,
     output: &Path,
     app_id: &str,
     version: &str,
     platform: &str,
+    branch: &str,
     url: Option<String>,
 ) -> Result<PathBuf> {
     let report = asset::validate_layout(layout)?;
-    // The publisher builds stable Flatpak refs regardless of release channel.
-    // Preparation and hosted-asset validation enforce that same invariant.
+    // The publisher builds the branch its channel declares. Preparation
+    // and hosted-asset validation enforce that same invariant.
     let expected = format!(
-        "app/{}/{}/stable",
+        "app/{}/{}/{branch}",
         app_id,
         platform
             .strip_prefix("linux-")
@@ -131,6 +140,7 @@ pub fn write(
         app_id: app_id.into(),
         version: version.into(),
         platform: platform.into(),
+        branch: branch.into(),
         package: asset::PACKAGE.into(),
         mime: asset::MIME.into(),
         filename,
@@ -216,15 +226,16 @@ pub fn validate_report(asset: &Prepared, report: &orchard_core::oci::VerifyRepor
     if report.manifest_size != asset.size {
         bail!("hosted manifest size differs from prepared asset");
     }
-    // The publisher builds stable Flatpak refs regardless of release channel.
-    // Preparation and hosted-asset validation enforce that same invariant.
+    // The publisher builds the branch its channel declares.
+    // Preparation and hosted-asset validation enforce that invariant.
     let expected = format!(
-        "app/{}/{}/stable",
+        "app/{}/{}/{}",
         asset.app_id,
         asset
             .platform
             .strip_prefix("linux-")
-            .context("expected Linux platform")?
+            .context("expected Linux platform")?,
+        asset.branch
     );
     if report.flatpak_ref.as_deref() != Some(&expected) {
         bail!("manifest ref differs from asset");
@@ -252,6 +263,7 @@ mod tests {
             "com.example.App",
             "1",
             "x86_64",
+            "stable",
             None,
         )
         .unwrap();
@@ -261,6 +273,7 @@ mod tests {
             "com.example.App",
             "1",
             "linux-x86_64",
+            "stable",
             None,
         )
         .unwrap();
@@ -295,6 +308,7 @@ mod tests {
             "com.example.App",
             "1",
             "linux-x86_64",
+            "stable",
             None,
         )
         .unwrap();

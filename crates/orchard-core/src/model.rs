@@ -59,6 +59,36 @@ pub struct Release {
     pub published_at: i64,
 }
 
+/// One channel's installable pick for this machine: what the detail
+/// page's dropdown installs when the row's default is not the one
+/// wanted. The channel name doubles as the flatpak branch (`stable`,
+/// `main`, and no channel all mean the stable branch, so the pick's
+/// channel is always the deploy branch).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelPick {
+    /// The channel (and deploy branch): `stable`, `beta`, ...
+    pub channel: String,
+    pub version: String,
+    /// Pinned manifest digest, `sha256:…`.
+    #[serde(default)]
+    pub digest: Option<String>,
+    /// Artifact location: an HTTP(S) manifest URL, local OCI layout,
+    /// or registry reference.
+    pub location: String,
+    /// Config/layer assets referenced by this release; None is a
+    /// legacy artifact.
+    #[serde(default)]
+    pub oci_assets: Option<Vec<crate::oci_asset::BlobAsset>>,
+    #[serde(default)]
+    pub published_at: i64,
+    #[serde(default)]
+    pub notes: Option<String>,
+}
+
+fn default_branch() -> String {
+    "stable".into()
+}
+
 /// A complete app listing as shown in the catalog.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Listing {
@@ -192,7 +222,17 @@ pub struct CatalogApp {
     #[serde(default)]
     pub platforms: Vec<String>,
     /// Full flatpak ref, e.g. `app/com.example.Hello/x86_64/stable`.
+    /// The branch segment is the default pick's channel.
     pub flatpak_ref: String,
+    /// The default pick's deploy branch: `stable` (also for the
+    /// `main` channel name), or another channel's name.
+    #[serde(default = "default_branch")]
+    pub branch: String,
+    /// Every channel's pick for this machine except the default (the
+    /// top-level fields carry the default): stable first, then the
+    /// others by newest release. Empty for a stable-only publisher.
+    #[serde(default)]
+    pub channels: Vec<ChannelPick>,
     /// Artifact location: an HTTP(S) manifest URL, local OCI layout, or registry reference.
     pub location: String,
     /// Pinned manifest digest, `sha256:…`.
@@ -277,6 +317,12 @@ pub struct StoreApp {
     /// Platform tags the listing claims (publisher channel only).
     /// Empty: unknown or reviewed channel.
     pub platforms: Vec<String>,
+    /// The default pick's deploy branch (publisher channel only):
+    /// `stable`, or another channel's name. None: reviewed channel.
+    pub branch: Option<String>,
+    /// Other channels' picks besides the default (publisher channel
+    /// only): the detail page's dropdown.
+    pub channels: Vec<ChannelPick>,
 }
 
 impl StoreApp {
@@ -305,6 +351,8 @@ impl StoreApp {
             oci_assets: None,
             successor_to: None,
             platforms: Vec::new(),
+            branch: None,
+            channels: Vec::new(),
         }
     }
 
@@ -338,6 +386,8 @@ impl StoreApp {
             oci_assets: app.oci_assets.clone(),
             successor_to: app.successor_to.clone(),
             platforms: app.platforms.clone(),
+            branch: Some(app.branch.clone()),
+            channels: app.channels.clone(),
         }
     }
 }

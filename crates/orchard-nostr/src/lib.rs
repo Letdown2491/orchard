@@ -23,7 +23,8 @@ use std::collections::BTreeMap;
 
 use anyhow::Result;
 use nostr::prelude::*;
-use orchard_core::{CatalogApp, CatalogFile, Publisher};
+use orchard_core::{CatalogApp, CatalogFile, ChannelPick, Publisher};
+use events::Asset;
 
 pub mod connect;
 pub mod events;
@@ -789,46 +790,69 @@ impl Feed {
                             .find(|asset| asset.platforms.is_empty())
                     })
             };
-            // walk releases newest-first; first one with an
-            // installable asset for this machine wins
-            fn stable<'a>(
+            // a publisher's releases for this author, newest-first
+            fn authored<'a>(
                 releases: &'a [Release],
                 author: &'a str,
             ) -> impl Iterator<Item = &'a Release> + 'a {
-                releases
-                    .iter()
-                    .filter(move |release| release.publisher == author)
-                    // flatpak installs from the stable branch; "main" is
-                    // Zapstore's default channel name for the same thing
-                    .filter(|release| {
-                        matches!(release.channel.as_deref(), None | Some("stable") | Some("main"))
-                    })
+                releases.iter().filter(move |release| release.publisher == author)
             }
-            let picked = self.releases.get(app_id).and_then(|releases| {
-                stable(releases, author)
-                    .filter(|release| {
-                        release.platform.as_deref().is_none_or(|built| built == platform)
-                    })
-                    .find_map(|release| Some((release, Some(installable(release)?))))
-            });
-            // the chain exists but builds nothing for this machine:
-            // project the row with no install, so the page can say
-            // what was built. A chain with no releases at all still
-            // stays invisible, as before.
-            let picked = picked.or_else(|| {
-                self.releases.get(app_id).and_then(|releases| {
-                    stable(releases, author).find(|release| {
-                            release
-                                .asset_refs
-                                .iter()
-                                .filter_map(same_publisher)
-                                .next()
-                                .is_some()
+            // channels are flatpak branches: None, `stable`, and
+            // `main` all mean the stable branch; anything else names
+            // its own branch
+            fn branch_of(release: &Release) -> String {
+                match release.channel.as_deref() {
+                    None | Some("stable") | Some("main") => "stable".to_string(),
+                    Some(other) => other.to_string(),
+                }
+            }
+            // One pick per branch: the newest release of the branch
+            // with an installable asset for this machine, or, when
+            // the branch builds nothing here but exists, a pick with
+            // no install. Branches with no releases at all do not
+            // project.
+            let mut picks: Vec<(String, &Release, Option<&Asset>)> = Vec::new();
+            let releases = self.releases.get(app_id);
+            if let Some(releases) = releases {
+                let mut branches: Vec<String> = authored(releases, author)
+                    .map(branch_of)
+                    .collect();
+                branches.sort();
+                branches.dedup();
+                for branch in branches {
+                    let in_branch = move |release: &Release| branch_of(release) == branch;
+                    let machine = authored(releases, author)
+                        .filter(|release| {
+                            in_branch(release)
+                                && release.platform.as_deref().is_none_or(|b| b == platform)
                         })
-                        .map(|release| (release, None))
-                })
+                        .find_map(|release| Some((release, Some(installable(release)?))));
+                    let pick = machine.or_else(|| {
+                        authored(releases, author).filter(|release| in_branch(release)).find(|release| {
+                                release
+                                    .asset_refs
+                                    .iter()
+                                    .filter_map(same_publisher)
+                                    .next()
+                                    .is_some()
+                            })
+                            .map(|release| (release, None))
+                    });
+                    if let Some((release, asset)) = pick {
+                        picks.push((branch, release, asset));
+                    }
+                }
+            }
+            // the default: stable when it picks, else the newest other
+            picks.sort_by(|a, b| {
+                let stable = |branch: &String| if branch == "stable" { 0 } else { 1 };
+                stable(&a.0)
+                    .cmp(&stable(&b.0))
+                    .then(b.1.created_at.cmp(&a.1.created_at))
             });
-            let Some((release, asset)) = picked else {
+            let Some((branch, release, asset)) = picks.first().cloned() else {
+                // the chain exists but builds nothing for this machine:
+                // stay invisible, as before
                 continue;
             };
             let (version, digest, location) = match asset {
@@ -842,6 +866,38 @@ impl Feed {
                 None => (String::new(), None, String::new()),
             };
             let ref_arch = platform.strip_prefix("linux-").unwrap_or(platform);
+            // the candidate components of one release for this
+            // publisher/platform, minus the flatpak blob itself
+            let components = |release: &Release, present: bool| {
+                present.then(|| {
+                    release.asset_refs.iter().filter_map(|id| self.assets.get(id))
+                        .filter(|a| a.event.pubkey.to_string() == *author)
+                        .filter(|a| a.platforms.iter().any(|p| p == platform))
+                        .filter_map(|a| a.blob.clone())
+                        .filter(|b| b.mime != orchard_core::oci_asset::MIME)
+                        .collect()
+                })
+            };
+            // every other channel's pick feeds the dropdown; the
+            // top-level fields carry the default
+            let channels = picks
+                .iter()
+                .skip(1)
+                .map(|(branch, release, asset)| ChannelPick {
+                    channel: branch.clone(),
+                    version: asset.map_or(String::new(), |_| release.version.clone()),
+                    digest: asset.and_then(|a| a.digest.clone()),
+                    location: asset
+                        .and_then(|a| a.location.clone())
+                        .unwrap_or_default(),
+                    oci_assets: asset
+                        .filter(|a| a.blob.is_some())
+                        .map(|_| components(release, true).unwrap_or_default()),
+                    published_at: release.created_at as i64,
+                    notes: (!release.event.content.is_empty())
+                        .then(|| release.event.content.clone()),
+                })
+                .collect();
             apps.push(CatalogApp {
                 app_id: app_id.clone(),
                 name: listing.name.clone(),
@@ -857,19 +913,17 @@ impl Feed {
                 },
                 version,
                 platforms: listing.platforms.clone(),
-                flatpak_ref: format!("app/{app_id}/{ref_arch}/stable"),
+                flatpak_ref: format!("app/{app_id}/{ref_arch}/{branch}"),
+                branch,
+                channels,
                 location,
                 digest,
                 // Candidate components span the release for this publisher/platform.
                 // Multiple manifests may share blobs. Verification selects only the
                 // chosen manifest's descriptors by hash, MIME and size before fetch.
-                oci_assets: asset.filter(|a| a.blob.is_some()).map(|_| {
-                    release.asset_refs.iter().filter_map(|id| self.assets.get(id))
-                        .filter(|a| a.event.pubkey.to_string() == *author)
-                        .filter(|a| a.platforms.iter().any(|p| p == platform))
-                        .filter_map(|a| a.blob.clone())
-                        .filter(|b| b.mime != orchard_core::oci_asset::MIME).collect()
-                }),
+                oci_assets: asset
+                    .filter(|a| a.blob.is_some())
+                    .map(|_| components(release, true).unwrap_or_default()),
                 metadata: None,
                 repository: listing.repository.clone(),
                 homepage: listing.homepage.clone(),

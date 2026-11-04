@@ -213,29 +213,40 @@ pub fn update() -> Command {
     cmd
 }
 
-/// Uninstall an app id from the given scope. User data is kept.
-pub fn uninstall(scope: Scope, app_id: &str) -> Command {
+/// Uninstall an app id from the given scope, at a branch when given:
+/// a partial ref (`app.id//branch`) so parallel channel deployments
+/// uninstall one at a time. User data is kept.
+pub fn uninstall(scope: Scope, app_id: &str, branch: Option<&str>) -> Command {
     let mut cmd = flatpak_command();
-    cmd.args(["uninstall", scope.flag(), "-y", app_id]);
+    cmd.args(["uninstall", scope.flag(), "-y"]);
+    cmd.arg(match branch {
+        Some(branch) => format!("{app_id}//{branch}"),
+        None => app_id.to_string(),
+    });
     cmd
 }
 
-/// Launch an installed app.
-pub fn run(app_id: &str) -> Command {
+/// Launch an installed app, at a branch when given: parallel channel
+/// deployments each get a launch of their own.
+pub fn run(app_id: &str, branch: Option<&str>) -> Command {
     let mut cmd = flatpak_command();
-    cmd.arg("run").arg(app_id);
+    cmd.arg("run");
+    cmd.arg(match branch {
+        Some(branch) => format!("{app_id}//{branch}"),
+        None => app_id.to_string(),
+    });
     cmd
 }
 
 /// List installed apps across installations:
-/// `flatpak list --app --columns=application,version,origin,installation`.
+/// `flatpak list --app --columns=application,version,branch,origin,installation`.
 /// Rows are tab-separated; `installation` is `user` or `system`.
 pub fn list_installed() -> Command {
     let mut cmd = flatpak_command();
     cmd.args([
         "list",
         "--app",
-        "--columns=application,version,origin,installation",
+        "--columns=application,version,branch,origin,installation",
     ]);
     cmd
 }
@@ -334,11 +345,15 @@ pub fn remote_metadata(scope: Scope, remote: &str, app_id: &str) -> Command {
 }
 
 /// Update an installed app to its remote's current commit:
-/// `flatpak update <scope> -y <app>`. The app's own origin remote
-/// supplies the new commit.
-pub fn update_ref(scope: Scope, app_id: &str) -> Command {
+/// `flatpak update <scope> -y <app>`, at a branch when given. The
+/// app's own origin remote supplies the new commit.
+pub fn update_ref(scope: Scope, app_id: &str, branch: Option<&str>) -> Command {
     let mut cmd = flatpak_command();
-    cmd.args(["update", scope.flag(), "-y", app_id]);
+    cmd.args(["update", scope.flag(), "-y"]);
+    cmd.arg(match branch {
+        Some(branch) => format!("{app_id}//{branch}"),
+        None => app_id.to_string(),
+    });
     cmd
 }
 
@@ -485,15 +500,21 @@ mod tests {
 
     #[test]
     fn uninstall_targets_the_given_scope() {
-        let cmd = uninstall(Scope::User, "rocks.orchard.Hello");
+        let cmd = uninstall(Scope::User, "rocks.orchard.Hello", None);
         assert_eq!(
             arg_strings(&cmd),
             ["uninstall", "--user", "-y", "rocks.orchard.Hello"]
         );
-        let cmd = uninstall(Scope::System, "org.gnome.Polari");
+        let cmd = uninstall(Scope::System, "org.gnome.Polari", None);
         assert_eq!(
             arg_strings(&cmd),
             ["uninstall", "--system", "-y", "org.gnome.Polari"]
+        );
+        // a branch narrows the uninstall to that deployment alone
+        let cmd = uninstall(Scope::User, "rocks.orchard.Hello", Some("beta"));
+        assert_eq!(
+            arg_strings(&cmd),
+            ["uninstall", "--user", "-y", "rocks.orchard.Hello//beta"]
         );
     }
 
@@ -509,11 +530,13 @@ mod tests {
     #[test]
     fn update_ref_builds_expected_invocation() {
         for (scope, flag) in [(Scope::System, "--system"), (Scope::User, "--user")] {
-            let cmd = update_ref(scope, "org.gnome.Polari");
+            let cmd = update_ref(scope, "org.gnome.Polari", None);
             let args = arg_strings(&cmd);
             let tail: Vec<String> = args.iter().skip(args.len() - 4).cloned().collect();
             assert_eq!(tail, ["update", flag, "-y", "org.gnome.Polari"]);
         }
+        let cmd = update_ref(Scope::User, "org.gnome.Polari", Some("beta"));
+        assert!(arg_strings(&cmd).contains(&"org.gnome.Polari//beta".to_string()));
     }
 
     #[test]
