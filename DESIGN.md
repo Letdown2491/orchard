@@ -323,7 +323,7 @@ sandbox; bump the pin with the runtime the publish manifest targets, and wipe
 | M4 | Permissions viewer (built, reads the real sandbox from the artifact); `orchard://` scheme handler | done |
 | M5 | Publish CLI: manifest → build → push → sign → events, proven live against a TLS registry | done |
 | M6 | Reviews, review trust, circle + two-hop graph, self-distribution (Orchard publishes itself through the ordinary path), rendezvous topology | code complete 2026-10-11 |
-| M7 | The public loop: tags ship through CI to ghcr, install and update through the GUI | v0.1.0 through v0.1.4 shipped |
+| M7 | The public loop: tags ship through CI to ghcr, install and update through the GUI | v0.1.0 through v0.4.0 shipped; the 0.3.0 to 0.4.0 self-update proven live 2026-11-04 |
 | M8 | Headless CLI on the multiplexed binary: job engine extraction, search/info/install/update/remove/list, relays | design agreed 2026-10-21 |
 
 **M7 open items:**
