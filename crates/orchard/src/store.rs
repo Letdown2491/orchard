@@ -32,6 +32,14 @@ const FLATHUB_REMOTE: &str = "flathub";
 /// matters is the outcome, which the bar also shows.
 const STATUS_HOLD: Duration = Duration::from_secs(10);
 
+/// How often the reviewed channels' appstream files are re-read from
+/// disk. Flatpak rewrites them on any metadata refresh (this
+/// client's own jobs, another store, a terminal update), and the
+/// parsed catalog is otherwise frozen at startup: without this, an
+/// update that landed mid-session shows only after a restart. Local
+/// work only; the network refresh belongs to the cadence-gated scan.
+const REVIEWED_REREAD_SECS: u32 = 300;
+
 /// Lifecycle of a per-app operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JobState {
@@ -254,6 +262,10 @@ pub struct StoreRoot {
     /// Flathub, then every extra enabled remote with a readable
     /// AppStream. Feeds the channel menu and the provenance badges.
     channels: Vec<RemoteChannel>,
+    /// The reviewed channels' appstream stamps, (mtime, size) per
+    /// remote at the last parse: the periodic re-read re-parses only
+    /// the files flatpak has rewritten since.
+    reviewed_stamps: HashMap<String, (std::time::SystemTime, u64)>,
     /// Remote images resolved through the disk cache: url -> path, or
     /// None when the fetch failed.
     fetched: HashMap<String, Option<PathBuf>>,
@@ -457,6 +469,7 @@ impl StoreRoot {
             error: None,
             reviewed_loading: true,
             channels: Vec::new(),
+            reviewed_stamps: HashMap::new(),
             fetched: HashMap::new(),
             fetching: HashSet::new(),
             cache_sizes: (0, 0),
@@ -632,11 +645,47 @@ impl StoreRoot {
         let update_settings = settings.clone();
         cx.spawn(async move |this, cx| {
             let mut since_check: u32 = 0;
+            let mut since_reread: u32 = 0;
             loop {
                 cx.background_executor()
                     .timer(std::time::Duration::from_secs(30))
                     .await;
                 since_check += 30;
+                since_reread += 30;
+                // The local re-read: the reviewed channels' appstream
+                // files move under the parsed rows (any flatpak client
+                // refreshes them: this one's own jobs, another store,
+                // a terminal update), and the install list moves with
+                // them. Local work only, so it runs whatever the
+                // update-check cadence says; absorb_reviewed's
+                // fingerprint gate makes an unchanged catalog a no-op.
+                if since_reread >= REVIEWED_REREAD_SECS {
+                    since_reread = 0;
+                    let (channels, stamps) = match this.update(cx, |this, _| {
+                        (this.channels.clone(), this.reviewed_stamps.clone())
+                    }) {
+                        Ok(ok) => ok,
+                        Err(_) => break,
+                    };
+                    let (apps, rendered, stamps) = cx
+                        .background_executor()
+                        .spawn(async move { reparse_reviewed(channels, stamps) })
+                        .await;
+                    if this
+                        .update(cx, |this, cx| {
+                            for (remote, stamp) in stamps {
+                                this.reviewed_stamps.insert(remote, stamp);
+                            }
+                            this.absorb_reviewed(apps, rendered, cx);
+                            // installs and removals that happened
+                            // outside this window show up here too
+                            this.refresh_installed(cx);
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
                 let due = match update_settings.get().update_checks.as_str() {
                     "hourly" => since_check >= 3600,
                     "daily" => since_check >= 86400,
@@ -647,11 +696,33 @@ impl StoreRoot {
                     continue;
                 }
                 since_check = 0;
+                // the appstreams themselves: flatpak fetches each
+                // rendered channel's current metadata, so a new
+                // release reaches the comparison with no other client
+                // needed to refresh it first. One at a time; the CLI
+                // serializes on its own lock anyway.
+                let channels = match this.update(cx, |this, _| this.channels.clone()) {
+                    Ok(channels) => channels,
+                    Err(_) => break,
+                };
+                let mut fresh: Vec<StoreApp> = Vec::new();
+                let mut rendered: Vec<RemoteChannel> = Vec::new();
+                for channel in channels {
+                    if let Some((rows, channel)) = cx
+                        .background_executor()
+                        .spawn(async move { refresh_channel(channel) })
+                        .await
+                    {
+                        fresh.extend(rows);
+                        rendered.push(channel);
+                    }
+                }
                 let orchard_apps = cx
                     .background_executor()
                     .spawn(async move { load_orchard_catalog() })
                     .await;
                 let _ = this.update(cx, |this, cx| {
+                    this.absorb_reviewed(fresh, rendered, cx);
                     this.apply_orchard_apps(orchard_apps, cx);
                     this.refresh_installed(cx);
                 });
@@ -683,8 +754,7 @@ impl StoreRoot {
                     .await
                 {
                     let _ = this.update(cx, |this, cx| {
-                        this.merge_reviewed(rows, channel);
-                        cx.notify();
+                        this.absorb_reviewed(rows, vec![channel], cx);
                     });
                 }
             }
@@ -958,35 +1028,18 @@ impl StoreRoot {
         .detach();
     }
 
-    /// Reviewed rows from a late-arriving channel (its appstream
-    /// synced after startup): drop the app ids an earlier reviewed
-    /// channel already rendered, then take the rest. Publisher twins
-    /// of the same id coexist by design; this only collapses the
-    /// reviewed side, same as the startup load.
-    fn merge_reviewed(&mut self, rows: Vec<StoreApp>, channel: RemoteChannel) {
-        let known: HashSet<String> = self
-            .apps
-            .iter()
-            .filter(|app| app.source == Source::Reviewed)
-            .map(|app| app.app_id.clone())
-            .collect();
-        self.apps
-            .extend(rows.into_iter().filter(|app| !known.contains(&app.app_id)));
-        self.channels.push(channel);
-    }
-
     /// Replace the publisher-channel rows with a fresh read of the
     /// merged catalog (indexd). A no-op when nothing changed, so the
     /// periodic refresh never disturbs list state. Sandbox metadata
     /// read earlier in the session (from the artifact) is transplanted:
     /// that fetch already happened and the pin has not moved.
     fn apply_orchard_apps(&mut self, incoming: Vec<StoreApp>, cx: &mut Context<Self>) {
-        let before = orchard_fingerprint(
+        let before = catalog_fingerprint(
             self.apps
                 .iter()
                 .filter(|app| app.source == Source::Publisher),
         );
-        let after = orchard_fingerprint(incoming.iter());
+        let after = catalog_fingerprint(incoming.iter());
         if before == after {
             return;
         }
@@ -1032,6 +1085,53 @@ impl StoreRoot {
         }
         self.ensure_nip05_checks(cx);
         self.ensure_repo_proofs(cx);
+        cx.notify();
+    }
+
+    /// Fold a fresh read of reviewed channels into the catalog: rows
+    /// for channels this read rendered are replaced, rows for every
+    /// other channel survive (its file did not change, or the read
+    /// never touched it). Channel order decides which row wins a
+    /// shared app id, same as the startup load's dedupe. A no-op when
+    /// the surviving rows' fingerprint is unchanged, so a periodic
+    /// re-read never disturbs list state. An open page whose app
+    /// vanished from every channel closes, as the publisher poll's
+    /// does.
+    fn absorb_reviewed(
+        &mut self,
+        fresh: Vec<StoreApp>,
+        rendered: Vec<RemoteChannel>,
+        cx: &mut Context<Self>,
+    ) {
+        if fresh.is_empty() && rendered.is_empty() {
+            return;
+        }
+        let before = catalog_fingerprint(
+            self.apps
+                .iter()
+                .filter(|app| app.source == Source::Reviewed),
+        );
+        let old_channels = std::mem::take(&mut self.channels);
+        let old: Vec<StoreApp> = self
+            .apps
+            .extract_if(.., |app: &mut StoreApp| app.source == Source::Reviewed)
+            .collect();
+        let (merged, channels) = merge_reviewed_channels(old, &old_channels, fresh, rendered);
+        let after = catalog_fingerprint(merged.iter());
+        if before == after {
+            // nothing the user can see moved: put the rows and the
+            // channel list back exactly as they were
+            self.apps.extend(merged);
+            self.channels = old_channels;
+            return;
+        }
+        self.channels = channels;
+        self.apps.extend(merged);
+        if self.page_open && self.selected_app().is_none() {
+            self.selected = None;
+            self.selected_publisher = None;
+            self.page_open = false;
+        }
         cx.notify();
     }
 
@@ -8189,28 +8289,56 @@ impl StoreRoot {
 
 // ----- catalog loaders (background) -----
 
-/// Flathub channel: parse the local AppStream for the system install.
-/// Session-stability fingerprint of the publisher rows: any change in
-/// identity, version, pin, or listing text should re-render; anything
-/// else is an idle refresh. Borrowing, not cloning: this runs every
-/// refresh tick, and the rows' strings are the payload.
-fn orchard_fingerprint<'a>(rows: impl IntoIterator<Item = &'a StoreApp>) -> String {
+/// Session-stability fingerprint of catalog rows, either channel: any
+/// change the UI can render (identity, version, release date, listing
+/// text, images, pins) should re-render; anything else is an idle
+/// refresh. Borrowing, not cloning: the publisher poll runs this every
+/// 30s and the reviewed re-read on its own cadence, and the rows'
+/// strings are the payload. Deliberately excludes `metadata`: the
+/// pre-install sandbox read lands on rows after the fact, and
+/// counting it would churn every poll after the first page open.
+fn catalog_fingerprint<'a>(rows: impl IntoIterator<Item = &'a StoreApp>) -> String {
     use std::fmt::Write as _;
     let mut fingerprint = String::new();
     for app in rows {
         let _ = writeln!(
             fingerprint,
-            "{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}",
+            "{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}",
             app.app_id,
             app.publisher.as_deref().unwrap_or(""),
             app.version.as_deref().unwrap_or(""),
-            app.pinned_digest.as_deref().unwrap_or(""),
+            app.release_date.as_deref().unwrap_or(""),
             app.name,
             app.summary,
-            app.successor_to.as_deref().unwrap_or(""),
+            app.description.as_deref().unwrap_or(""),
+            app.homepage.as_deref().unwrap_or(""),
+            app.developer.as_deref().unwrap_or(""),
+            app.license.as_deref().unwrap_or(""),
         );
-        // A new release may relocate blobs without changing the image hash.
-        let _ = writeln!(fingerprint, "{:?}{:?}", app.location, app.oci_assets);
+        let _ = writeln!(
+            fingerprint,
+            "{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}",
+            app.remote.as_deref().unwrap_or(""),
+            app.icon_path
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_default(),
+            app.icon_url.as_deref().unwrap_or(""),
+            app.categories.join("\u{2}"),
+            app.screenshots.join("\u{2}"),
+        );
+        // A new release may relocate blobs without changing the image
+        // hash, and platforms ride the listing.
+        let _ = writeln!(
+            fingerprint,
+            "{}\u{1}{}\u{1}{:?}\u{1}{}\u{1}{}\u{1}{}",
+            app.pinned_digest.as_deref().unwrap_or(""),
+            app.successor_to.as_deref().unwrap_or(""),
+            (app.location.as_deref(), &app.oci_assets),
+            app.repository.as_deref().unwrap_or(""),
+            app.platforms.join("\u{2}"),
+            app.source == Source::Publisher,
+        );
     }
     fingerprint
 }
@@ -8631,6 +8759,69 @@ fn refresh_channel(channel: RemoteChannel) -> Option<(Vec<StoreApp>, RemoteChann
     Some((apps, channel))
 }
 
+/// A periodic re-read of the reviewed channels' appstream files from
+/// disk: flatpak rewrites them on any metadata refresh (this
+/// client's own jobs, another store, a terminal update), and the
+/// parsed catalog must not stay frozen until a restart. Only files
+/// whose (mtime, size) stamp moved since the last read are parsed;
+/// channels whose file is unchanged, missing, or unreadable come
+/// back unrendered and the caller keeps their rows. Returns the
+/// stamps of the files it parsed, for the next read's comparison.
+fn reparse_reviewed(
+    channels: Vec<RemoteChannel>,
+    stamps: HashMap<String, (std::time::SystemTime, u64)>,
+) -> (
+    Vec<StoreApp>,
+    Vec<RemoteChannel>,
+    HashMap<String, (std::time::SystemTime, u64)>,
+) {
+    let arch = orchard_core::host_ref_arch();
+    let mut apps = Vec::new();
+    let mut rendered = Vec::new();
+    let mut new_stamps = HashMap::new();
+    for channel in channels {
+        let Some(path) = orchard_core::appstream::appstream_paths(&channel.remote, &arch)
+            .into_iter()
+            .find(|path| path.exists())
+        else {
+            continue;
+        };
+        let Ok(meta) = std::fs::metadata(&path) else {
+            continue;
+        };
+        let Ok(modified) = meta.modified() else {
+            continue;
+        };
+        let stamp = (modified, meta.len());
+        if stamps.get(&channel.remote) == Some(&stamp) {
+            continue;
+        }
+        let icons_root = path
+            .parent()
+            .map(|active| active.join("icons"))
+            .unwrap_or_default();
+        match orchard_core::appstream::load(&path, &icons_root) {
+            Ok(rows) => {
+                eprintln!(
+                    "{} catalog: {} apps after a re-read",
+                    channel.remote,
+                    rows.len()
+                );
+                apps.extend(
+                    rows.iter()
+                        .map(|row| StoreApp::from_appstream(row, &channel.remote)),
+                );
+                new_stamps.insert(channel.remote.clone(), stamp);
+                rendered.push(channel);
+            }
+            // a half-written or unreadable file keeps the old rows:
+            // say so, and try again on the next re-read
+            Err(err) => eprintln!("{} catalog: re-read failed: {err:#}", channel.remote),
+        }
+    }
+    (apps, rendered, new_stamps)
+}
+
 /// The built-in channel: flathub, titled and scoped from the
 /// enumeration when it took place. The historical shape (system
 /// scope, the "Flathub" label) is the fallback.
@@ -8701,6 +8892,84 @@ fn dedupe_reviewed(apps: Vec<StoreApp>) -> Vec<StoreApp> {
     apps.into_iter()
         .filter(|app| seen.insert(app.app_id.clone()))
         .collect()
+}
+
+/// The merge behind [`StoreRoot::absorb_reviewed`]: fresh rows stand
+/// in for the channels this read rendered, rows from every other
+/// channel survive untouched, and channel order decides which row
+/// wins a shared app id (Flathub ahead of the extras, new channels
+/// behind, the startup load's rule). Returns the merged rows and the
+/// surviving channel list in that priority order.
+fn merge_reviewed_channels(
+    old: Vec<StoreApp>,
+    old_channels: &[RemoteChannel],
+    fresh: Vec<StoreApp>,
+    rendered: Vec<RemoteChannel>,
+) -> (Vec<StoreApp>, Vec<RemoteChannel>) {
+    let rendered_remotes: HashSet<String> = rendered.iter().map(|c| c.remote.clone()).collect();
+    let mut carried: HashMap<String, Vec<StoreApp>> = HashMap::new();
+    for app in old {
+        let remote = app.remote.clone().unwrap_or_default();
+        if !rendered_remotes.contains(&remote) {
+            carried.entry(remote).or_default().push(app);
+        }
+    }
+    let mut fresh_by_remote: HashMap<String, Vec<StoreApp>> = HashMap::new();
+    for app in fresh {
+        let remote = app.remote.clone().unwrap_or_default();
+        fresh_by_remote.entry(remote).or_default().push(app);
+    }
+    let mut priority: Vec<String> = old_channels.iter().map(|c| c.remote.clone()).collect();
+    for channel in &rendered {
+        if !priority.contains(&channel.remote) {
+            priority.push(channel.remote.clone());
+        }
+    }
+    let mut merged: Vec<StoreApp> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut channels: Vec<RemoteChannel> = Vec::new();
+    for remote in &priority {
+        let rows = match fresh_by_remote.remove(remote) {
+            Some(rows) => Some(rows),
+            None => carried.remove(remote),
+        };
+        let fresh_channel = rendered.iter().find(|c| &c.remote == remote);
+        if rows.is_none() && fresh_channel.is_none() {
+            continue;
+        }
+        if let Some(channel) = fresh_channel
+            .or_else(|| old_channels.iter().find(|c| &c.remote == remote))
+        {
+            channels.push(channel.clone());
+        }
+        for app in rows.unwrap_or_default() {
+            // first-wins per app id, the startup dedupe's rule
+            if seen.insert(app.app_id.clone()) {
+                merged.push(app);
+            }
+        }
+    }
+    // rows whose channel fell out of both lists (caller drift, a
+    // remote that left the enumeration) survive behind the ranked
+    // ones rather than vanishing
+    let mut leftovers: Vec<String> = fresh_by_remote
+        .keys()
+        .chain(carried.keys())
+        .cloned()
+        .collect();
+    leftovers.sort();
+    leftovers.dedup();
+    for remote in leftovers {
+        let rows = fresh_by_remote
+            .remove(&remote)
+            .or_else(|| carried.remove(&remote));
+        for app in rows.unwrap_or_default() {
+            if seen.insert(app.app_id.clone()) {
+                merged.push(app);
+            }
+        }
+    }
+    (merged, channels)
 }
 
 /// Orchard channel: catalog over HTTP from indexd, file fallback.
@@ -9632,7 +9901,7 @@ mod tests {
     }
 
     #[test]
-    fn orchard_fingerprint_changes_with_updates() {
+    fn catalog_fingerprint_changes_with_updates() {
         let mut app = StoreApp::from_catalog(&CatalogApp {
             app_id: "com.example.Hello".into(),
             name: "Hello".into(),
@@ -9658,23 +9927,117 @@ mod tests {
             published_at: 0,
             successor_to: None,
         });
-        let same = orchard_fingerprint(std::slice::from_ref(&app));
-        assert_eq!(same, orchard_fingerprint(std::slice::from_ref(&app)));
+        let same = catalog_fingerprint(std::slice::from_ref(&app));
+        assert_eq!(same, catalog_fingerprint(std::slice::from_ref(&app)));
         // a new release changes the fingerprint (row + page must refresh)
         let mut updated = app.clone();
         updated.version = Some("1.1.0".into());
-        assert_ne!(same, orchard_fingerprint(std::slice::from_ref(&updated)));
+        assert_ne!(same, catalog_fingerprint(std::slice::from_ref(&updated)));
+        // so does the release date the list sorts by
+        let mut dated = app.clone();
+        dated.release_date = Some("2026-10-11".into());
+        assert_ne!(same, catalog_fingerprint(std::slice::from_ref(&dated)));
         let mut relocated = app.clone();
         relocated.oci_assets = Some(vec![orchard_core::oci_asset::BlobAsset {
             sha256: "a".repeat(64), url: "https://first.example/blob".into(),
             mime: "application/vnd.oci.image.config.v1+json".into(), size: 42,
         }]);
-        let old = orchard_fingerprint(std::slice::from_ref(&relocated));
+        let old = catalog_fingerprint(std::slice::from_ref(&relocated));
         relocated.oci_assets.as_mut().unwrap()[0].url = "https://second.example/blob".into();
-        assert_ne!(old, orchard_fingerprint(std::slice::from_ref(&relocated)));
+        assert_ne!(old, catalog_fingerprint(std::slice::from_ref(&relocated)));
         // so does a listing edit
         app.summary = "Edited summary".into();
-        assert_ne!(same, orchard_fingerprint(std::slice::from_ref(&app)));
+        assert_ne!(same, catalog_fingerprint(std::slice::from_ref(&app)));
+    }
+
+    #[test]
+    fn reviewed_merge_replaces_rendered_channels_and_keeps_the_rest() {
+        let flathub = RemoteChannel {
+            remote: FLATHUB_REMOTE.into(),
+            title: "Flathub".into(),
+            user_scope: false,
+        };
+        let flatpark = RemoteChannel {
+            remote: "flatpark".into(),
+            title: "Flatpark".into(),
+            user_scope: false,
+        };
+        let old_flathub = reviewed_app("com.example.One", "old flathub", FLATHUB_REMOTE);
+        let old_park = reviewed_app("com.example.Two", "old park", "flatpark");
+        // a re-read of flathub only: its row is replaced, flatpark's survives
+        let new_flathub = reviewed_app("com.example.One", "new flathub", FLATHUB_REMOTE);
+        let (merged, channels) = merge_reviewed_channels(
+            vec![old_flathub, old_park],
+            &[flathub.clone(), flatpark.clone()],
+            vec![new_flathub],
+            vec![flathub.clone()],
+        );
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].summary, "new flathub");
+        assert_eq!(merged[1].summary, "old park");
+        assert_eq!(channels, vec![flathub, flatpark]);
+    }
+
+    #[test]
+    fn reviewed_merge_keeps_channel_priority_for_shared_ids() {
+        let flathub = RemoteChannel {
+            remote: FLATHUB_REMOTE.into(),
+            title: "Flathub".into(),
+            user_scope: false,
+        };
+        let flatpark = RemoteChannel {
+            remote: "flatpark".into(),
+            title: "Flatpark".into(),
+            user_scope: false,
+        };
+        // one app id both channels serve: flathub's row wins at startup,
+        // and a flatpark-only re-read must not promote flatpark's twin
+        let old_flathub = reviewed_app("com.example.Overlap", "flathub's row", FLATHUB_REMOTE);
+        let old_park = reviewed_app("com.example.Other", "old park", "flatpark");
+        let new_park = reviewed_app("com.example.Overlap", "park's row", "flatpark");
+        let new_park_other = reviewed_app("com.example.Other", "new park", "flatpark");
+        let (merged, _) = merge_reviewed_channels(
+            vec![old_flathub, old_park],
+            &[flathub.clone(), flatpark.clone()],
+            vec![new_park, new_park_other],
+            vec![flatpark.clone()],
+        );
+        let overlap = merged
+            .iter()
+            .find(|app| app.app_id == "com.example.Overlap")
+            .unwrap();
+        assert_eq!(overlap.summary, "flathub's row");
+        assert_eq!(overlap.remote.as_deref(), Some(FLATHUB_REMOTE));
+        assert_eq!(merged.len(), 2);
+    }
+
+    #[test]
+    fn reviewed_merge_adopts_a_channel_the_store_did_not_render_yet() {
+        let flathub = RemoteChannel {
+            remote: FLATHUB_REMOTE.into(),
+            title: "Flathub".into(),
+            user_scope: false,
+        };
+        let flatpark = RemoteChannel {
+            remote: "flatpark".into(),
+            title: "Flatpark".into(),
+            user_scope: false,
+        };
+        let old = reviewed_app("com.example.One", "old flathub", FLATHUB_REMOTE);
+        let fresh = reviewed_app("com.example.Two", "park's first", "flatpark");
+        // the late-arrival path: a brand-new channel's rows join the
+        // catalog and its channel joins the list behind the built-ins
+        let (merged, channels) = merge_reviewed_channels(
+            vec![old],
+            &[flathub.clone()],
+            vec![fresh],
+            vec![flatpark.clone()],
+        );
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[1].summary, "park's first");
+        assert_eq!(channels.len(), 2);
+        assert_eq!(channels[0].remote, FLATHUB_REMOTE);
+        assert_eq!(channels[1], flatpark);
     }
 
     #[test]
