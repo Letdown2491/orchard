@@ -299,8 +299,8 @@ mod tests {
     fn build_is_deterministic_and_self_consistent() {
         let dir = demo_tree();
         let tree = dir.join("tree");
-        let a = build(&tree, &dir.join("layout-a"), "com.x", "1.0.0", "x86_64", None).unwrap();
-        let b = build(&tree, &dir.join("layout-b"), "com.x", "1.0.0", "x86_64", None).unwrap();
+        let a = build(&tree, &dir.join("layout-a"), "com.x", "1.0.0", "x86_64", "stable", None).unwrap();
+        let b = build(&tree, &dir.join("layout-b"), "com.x", "1.0.0", "x86_64", "stable", None).unwrap();
         // same tree, same bytes, same manifest digest
         assert_eq!(a.manifest_digest, b.manifest_digest);
         // the written blob hashes back to the digest in the index

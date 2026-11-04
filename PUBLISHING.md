@@ -119,7 +119,9 @@ homepage = "https://you.example"        # optional; omit if the repo is the page
 
 [release]
 version = "1.2.0"                       # or ORCHARD_PUBLISH_VERSION in CI
-channel = "stable"                      # stable (default) or beta
+channel = "stable"                      # stable (default), beta, or any name
+branch = "stable"                       # optional; defaults to the channel. The
+                                        # flatpak branch the artifact deploys at
 arch = "linux-x86_64"                   # this build's target
 platforms = ["linux-x86_64", "linux-aarch64"]   # full coverage the listing claims
 notes = "What changed in 1.2.0."        # the release's changelog
@@ -137,6 +139,11 @@ nip05 = "you@yourdomain.example"        # optional; the verified-address claim
 
 Field notes:
 
+- `channel` is what the client shows and `branch` is what flatpak deploys:
+  they must agree, and publication fails otherwise. `stable` and `main`
+  (and no channel) all mean the stable branch; any other channel name
+  doubles as the branch. Override the branch in CI with
+  `ORCHARD_PUBLISH_BRANCH`.
 - `categories` must use the client's exact chip spellings: Games,
   Utilities, Audio & Video, Development, Network, Office, Graphics,
   Science, Education, System. AppStream's canonical names (`Utility`,

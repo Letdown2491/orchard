@@ -371,6 +371,7 @@ tree = "absent"
             app_id: "com.example.App".into(),
             version: "1".into(),
             platform: platform.into(),
+            branch: "stable".into(),
             package: "flatpak-oci".into(),
             components: Vec::new(),
             mime: orchard_core::oci_asset::MIME.into(),

@@ -24,7 +24,6 @@ use std::collections::BTreeMap;
 use anyhow::Result;
 use nostr::prelude::*;
 use orchard_core::{CatalogApp, CatalogFile, ChannelPick, Publisher};
-use events::Asset;
 
 pub mod connect;
 pub mod events;
@@ -820,7 +819,10 @@ impl Feed {
                 branches.sort();
                 branches.dedup();
                 for branch in branches {
-                    let in_branch = move |release: &Release| branch_of(release) == branch;
+                    let in_branch = {
+                        let branch = branch.clone();
+                        move |release: &Release| branch_of(release) == branch.as_str()
+                    };
                     let machine = authored(releases, author)
                         .filter(|release| {
                             in_branch(release)

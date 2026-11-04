@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+- **Multi-channel releases.** A publisher is no longer required to build
+  the stable branch only: a release's channel names its flatpak branch
+  (`stable` and `main` mean stable, anything else deploys at its own
+  branch), `orchard-publish` takes `release.branch` (or
+  `ORCHARD_PUBLISH_BRANCH`) and fails when branch and channel disagree,
+  and the client shows a channel flag on non-stable rows, a channel
+  dropdown beside the page's install button, and deploys channels in
+  parallel (update matching is same-branch only).
+- **Copyable install errors.** The status bar's install error line opens
+  a modal carrying the full text with a Copy button, for pasting into a
+  bug report.
+
 ## v0.3.0 (2026-10-21)
 
 - **Releases publish as NIP-82 component assets.** A self-publication now

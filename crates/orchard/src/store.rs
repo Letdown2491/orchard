@@ -2382,7 +2382,6 @@ impl StoreRoot {
             app.pinned_digest = pick.digest.clone();
             app.oci_assets = pick.oci_assets.clone();
             app.branch = Some(branch.to_string());
-            app.notes = pick.notes.clone();
         }
         match app.source {
             Source::Reviewed => {
@@ -7081,7 +7080,7 @@ impl StoreRoot {
         // the subject row, cloned out of the catalog: twins
         // disambiguated by publisher where one is named
         let (app_id, publisher) = match &confirm {
-            Confirm::Install { app_id, publisher } | Confirm::Update { app_id, publisher } => {
+            Confirm::Install { app_id, publisher, .. } | Confirm::Update { app_id, publisher } => {
                 (app_id.clone(), publisher.clone())
             }
             Confirm::Remove { app_id, .. } => (app_id.clone(), None),
@@ -7473,8 +7472,13 @@ impl StoreRoot {
                 |_e: &MouseDownEvent, _w, cx: &mut gpui::App| cx.stop_propagation(),
             )
             .children(picks.into_iter().map(|pick| {
+                let pick_channel = pick.channel.clone();
+                let pick_label = pick_channel.clone();
+                let pick_app_id = app_id.clone();
+                let pick_publisher = publisher.clone();
+                let pick_version = pick.version.clone();
                 div()
-                    .id(SharedString::from(format!("branch-item-{}", pick.channel)))
+                    .id(SharedString::from(format!("branch-item-{pick_channel}")))
                     .flex()
                     .items_center()
                     .justify_between()
@@ -7487,17 +7491,17 @@ impl StoreRoot {
                     .on_click(cx.listener(move |this, _e: &ClickEvent, _w, cx| {
                         this.branch_menu = None;
                         this.confirm = Some(Confirm::Install {
-                            app_id: app_id.clone(),
-                            publisher: publisher.clone(),
-                            branch: Some(pick.channel.clone()),
+                            app_id: pick_app_id.clone(),
+                            publisher: pick_publisher.clone(),
+                            branch: Some(pick_channel.clone()),
                         });
                         cx.notify();
                     }))
-                    .child(pick.channel.clone())
+                    .child(pick_label)
                     .child(
                         div()
                             .text_color(ui::text_dim())
-                            .child(pick.version.clone()),
+                            .child(pick_version),
                     )
             }))
             .into_any_element()
@@ -7505,7 +7509,8 @@ impl StoreRoot {
 
     /// The sort dropdown: the list order options with the active one
     /// marked. Same machinery as the channel menu: the panel stops
-    /// mouse down so its clicks survive the behind-everything overlay.    fn render_sort_menu(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
+    /// mouse down so its clicks survive the behind-everything overlay.
+    fn render_sort_menu(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let anchor = self.sort_menu.unwrap_or_default();
         let left = (anchor.x - px(60.)).max(px(8.));
         div()
@@ -8521,6 +8526,7 @@ impl StoreRoot {
                         )
                         .child(
                             div()
+                                .id("error-modal-text")
                                 .max_h(px(320.))
                                 .overflow_y_scroll()
                                 .text_size(px(ui::TEXT_SIZE))
@@ -8536,7 +8542,7 @@ impl StoreRoot {
                                     Tone::Quiet,
                                 )
                                 .on_click(cx.listener(move |this, _e: &ClickEvent, _w, cx| {
-                                    cx.write_to_clipboard(gpui::ClipboardItem::new_new_string(
+                                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(
                                         copy_text.clone(),
                                     ));
                                     this.error_modal = false;
