@@ -12,11 +12,11 @@ repository = "https://github.com/Letdown2491/orchard"
 icon = "https://raw.githubusercontent.com/Letdown2491/orchard/main/assets/orchard-512.png"
 
 [release]
-version = "0.3.0"
+version = "0.4.0"
 arch = "linux-x86_64"
 # Every declared platform must be present in the combined release.
 platforms = ["linux-x86_64", "linux-aarch64"]
-notes = "App pages show screenshots: publisher listings carry image URLs (the same strip reviewed apps always had). First release through the self-update chain: coming from 0.2.0, update in place; nothing to do by hand."
+notes = "Multi-channel releases: publishers may ship beta (or any named) channel beside stable; the client shows a channel flag on rows, a channel dropdown on the app page, and deploys channels in parallel. Install errors open a copyable dialog for bug reports. orchard:// links open app pages. An update that completes a signed publisher handover says so instead of warning about a new key."
 
 [artifact]
 tree = "tree"

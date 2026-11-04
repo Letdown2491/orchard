@@ -35,6 +35,10 @@ client, not a gatekeeper.**
 | Trust grouping | Flathub listings group by the developer claim (navigation); Orchard listings group by publisher key only |
 | Trust scoring | No reputation scores, no WoT-as-a-service: trust renders as facts qualified by the personal graph, never as computed judgments |
 | Provenance | Cosign dropped: the Nostr signature binds publisher identity to the pinned digest; a second signature chain adds a trust source without adding trust |
+| CLI surface | One multiplexed `orchard` binary: bare invocation opens the GUI, subcommands run headless (`search`, `info`, `install`, `update`, `remove`, `list`, `relays`); parsed with clap (new dependency, the `orchard` binary only) |
+| CLI confirmations | The CLI prints the same disclosure as the modal and prompts y/N on a TTY; a piped run refuses to proceed without an explicit `--yes` |
+| CLI catalog | The CLI reuses a running client's indexd on `127.0.0.1:7780` when it answers, otherwise boots an ephemeral in-process instance for the invocation |
+| Release channels | A release channel names its flatpak branch: `stable` and `main` (and no channel) mean the stable branch, any other name deploys at its own branch. The publisher bakes the branch into the ref label and hard-fails when branch and channel disagree; the client projects one pick per channel, flags non-stable rows, and installs parallel per-branch deployments (update matching is same-branch only) |
 
 ## What each project contributes
 
@@ -253,6 +257,33 @@ itself stays read-only over flatpak state: no `remote-add`, no key handling.
   edits persist atomically and apply live (relay edits within a second). Precedence:
   environment beats file beats defaults. Trust-relevant behavior is never configurable.
 
+## CLI
+
+Headless access to the same store: for users without the GUI, and for scripts. The
+binary is multiplexed, so `flatpak run <app-id> search foo` works inside the flatpak
+with no second exported binary.
+
+- **Shared job engine:** the install, update, and remove paths (digest verification
+  against the release pin, runtime pre-flight, the uninstall-then-install update
+  seam, the believe-it-only-when-a-fresh-installation-list-agrees verdict, and the
+  confirm disclosure data) are extracted from the GPUI store into a headless crate
+  the GUI and the CLI both call. The CLI never re-implements the seam; this
+  extraction is the bulk of the work and lands first.
+- **Commands:** `search`, `info`, `install`, `update`, `remove`, `list`,
+  `relays list|add|remove|reset`.
+- **Catalog:** reuse a running client's indexd on `127.0.0.1:7780` when it answers
+  (shared event cache, fast repeat queries); otherwise embed an ephemeral instance,
+  the way the GUI does, and tear it down at exit.
+- **Confirmations:** print the disclosure (version, publisher/proof state,
+  medium-and-high grants) and prompt y/N on a TTY. Piped runs need an explicit
+  `--yes`. The prompt is the CLI's one confirm modal.
+- **Relays:** `orchard relays` edits the same `settings.json` through the shared
+  `SettingsHandle`, so a running GUI applies the change live.
+- **Out of scope (v1):** classic flatpak remote management (read-only over flatpak
+  state stands; `flatpak remote-add` already exists and stays the tool for it), and
+  identity: NIP-46 sign-in, reviews, and publishing stay GUI-only for now, a
+  headless signer is its own project.
+
 ## Crates
 
 | Crate | Role |
@@ -289,10 +320,11 @@ sandbox; bump the pin with the runtime the publish manifest targets, and wipe
 | M1 | Client shell: GPUI window, Flathub catalog from local AppStream, search, detail, install with progress | done |
 | M2 | Flatpak seam in one crate; sandbox networking (sandbox-bound port reachable from host) verified | done |
 | M3 | Nostr read path: relay connect, kinds fetched and verified, merge into the publisher channel, proven end to end with a hand-rolled test publisher | done |
-| M4 | Permissions viewer (built, reads the real sandbox from the artifact); `orchard://` scheme handler | viewer done; handler not built |
+| M4 | Permissions viewer (built, reads the real sandbox from the artifact); `orchard://` scheme handler | done |
 | M5 | Publish CLI: manifest → build → push → sign → events, proven live against a TLS registry | done |
 | M6 | Reviews, review trust, circle + two-hop graph, self-distribution (Orchard publishes itself through the ordinary path), rendezvous topology | code complete 2026-10-11 |
 | M7 | The public loop: tags ship through CI to ghcr, install and update through the GUI | v0.1.0 through v0.1.4 shipped |
+| M8 | Headless CLI on the multiplexed binary: job engine extraction, search/info/install/update/remove/list, relays | design agreed 2026-10-21 |
 
 **M7 open items:**
 

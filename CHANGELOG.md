@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.4.0 (2026-11-03)
 
 - **Multi-channel releases.** A publisher is no longer required to build
   the stable branch only: a release's channel names its flatpak branch
