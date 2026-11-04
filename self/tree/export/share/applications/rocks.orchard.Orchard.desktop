@@ -2,7 +2,8 @@
 Type=Application
 Name=Orchard
 Comment=A permissionless Flatpak store
-Exec=orchard
+Exec=orchard %u
 Icon=rocks.orchard.Orchard
 Terminal=false
 Categories=Utility;
+MimeType=x-scheme-handler/orchard;

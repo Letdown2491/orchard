@@ -106,6 +106,11 @@ fn main() {
         settings.clone(),
     );
     let settings_for_root = settings.clone();
+    // a scheme-handler launch: the desktop environment hands an
+    // `orchard://` URL over as argv when a link is opened
+    let deep_link = std::env::args()
+        .skip(1)
+        .find(|arg| arg.starts_with("orchard://"));
 
     Application::new()
         .with_assets(assets::Assets)
@@ -127,6 +132,11 @@ fn main() {
                 |window, cx| {
                     let settings = settings_for_root.clone();
                     let root = cx.new(|cx| StoreRoot::new(cx, settings));
+                    // a link launch opens the linked app's page
+                    // directly; an ordinary launch lands on the list
+                    if let Some(url) = &deep_link {
+                        root.update(cx, |root, cx| root.open_deep_link(url, cx));
+                    }
                     // Keyboard lives on the root from the start (type to search).
                     window.focus(&root.read(cx).focus_handle);
                     root

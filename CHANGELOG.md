@@ -13,6 +13,15 @@
 - **Copyable install errors.** The status bar's install error line opens
   a modal carrying the full text with a Copy button, for pasting into a
   bug report.
+- **The `orchard://` scheme handler (M4 complete).** The desktop entry
+  registers `x-scheme-handler/orchard`; a link like
+  `orchard://app/<id>?publisher=<key>` opens that app's page (flatpak
+  exports the mime type at install). Malformed links open nothing.
+- **Handover re-anchoring.** An installed app whose publisher handed
+  over updates against the successor's row, and the update names the
+  handover ("completes the publisher handover") instead of warning
+  about a new key: the installed key's signed migration is the
+  authorization, and it rides the row as `successor_to`.
 
 ## v0.3.0 (2026-10-21)
 

@@ -52,8 +52,8 @@ through this repo's own workflow: tags land on the releases page as
 signed OCI artifacts, and the installed client updates through Orchard's
 own catalog. The full loop works end to end on real infrastructure:
 publish, discover, verify, install, update, review. Multi-arch (x86_64
-and aarch64) builds in CI. Not built yet: the `orchard://` scheme
-handler and signed-lineage folding for multi-publisher listings.
+and aarch64) builds in CI. Not built yet: signed-lineage folding for
+multi-publisher listings.
 `DESIGN.md` is the architecture record; `PUBLISHING.md` is the publisher
 guide.
 

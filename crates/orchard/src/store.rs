@@ -943,9 +943,22 @@ impl StoreRoot {
         cx.notify();
     }
 
+    /// Follow an `orchard://` deep link: open the named app's page,
+    /// naming the twin when the link carries a publisher key. The
+    /// desktop file registers the scheme; the OS hands the URL to a
+    /// new (or activated) instance as argv.
+    pub fn open_deep_link(&mut self, url: &str, cx: &mut Context<Self>) {
+        let Some((app_id, publisher)) = parse_deep_link(url) else {
+            return;
+        };
+        self.selected_publisher = publisher;
+        self.open_page(&app_id, cx);
+    }
+
     /// Open the detail page for an app and queue its remote images
     /// (icon fallback and screenshots) for the disk cache.
-    fn open_page(&mut self, app_id: &str, cx: &mut Context<Self>) {        let is_new = self.selected.as_deref() != Some(app_id);
+    fn open_page(&mut self, app_id: &str, cx: &mut Context<Self>) {
+        let is_new = self.selected.as_deref() != Some(app_id);
         self.selected = Some(app_id.to_string());
         if is_new {
             // the strip's horizontal scroll and the page's vertical
@@ -4622,13 +4635,18 @@ impl StoreRoot {
 
         // the update's key differs from the deployed artifact's: the
         // fact rides above the content as a banner, a fact not a
-        // verdict (the Update button is amber for every update)
-        let update_changed = self
-            .deployment(&app_id, app.branch.as_deref())
-            .is_some_and(|info| update_available(&app, info))
-            && self
-                .installed_from(app_id.as_str())
-                .is_some_and(|from| Some(from) != app.publisher.as_deref());
+        // verdict (the Update button is amber for every update). A
+        // signed handover names the difference: that is an authorized
+        // re-anchor, not an unexplained key change.
+        let key_change_note = self.installed_from(app_id.as_str()).and_then(|from| {
+            (Some(from) != app.publisher.as_deref()).then(|| {
+                if handover_authorized(&app, from) {
+                    "This update completes the publisher handover to a new key."
+                } else {
+                    "This update is signed by a new publisher key."
+                }
+            })
+        });
 
         // the page action: the running job's pill, or the primary
         // buttons, in the header's top right. The destructive Remove
@@ -4873,7 +4891,7 @@ impl StoreRoot {
                 .child(page_actions),
             );
 
-        content = content.children(update_changed.then(|| {
+        content = content.children(key_change_note.map(|note| {
             div()
                 .flex()
                 .items_center()
@@ -4885,7 +4903,7 @@ impl StoreRoot {
                 .text_size(px(ui::TEXT_SIZE))
                 .text_color(ui::risk_color(Risk::Medium))
                 .child(ui::icon("icons/shield.svg", 13., ui::risk_color(Risk::Medium)))
-                .child("This update is signed by a new publisher key.")
+                .child(note)
         }));
 
         if !app.screenshots.is_empty() {
@@ -7167,11 +7185,22 @@ impl StoreRoot {
                 Tone::Accent,
             ),            Confirm::Update { app_id, publisher } => {
                 // the row badges are gone, so the modal is where a
-                // launch from the list still names a key change
-                let key_note = self
-                    .installed_from(app_id)
-                    .is_some_and(|from| Some(from) != publisher.as_deref())
-                    .then(|| "This update is signed by a new publisher key.".to_string());
+                // launch from the list still names a key change. A
+                // signed handover is not a warning: the successor key
+                // is the authorized re-anchor of the same app
+                let key_note = self.installed_from(app_id).and_then(|from| {
+                    (Some(from) != publisher.as_deref()).then(|| {
+                        let app = self
+                            .apps
+                            .iter()
+                            .find(|a| a.app_id == *app_id && a.publisher.as_deref() == publisher.as_deref());
+                        if app.is_some_and(|app| handover_authorized(app, from)) {
+                            "This update completes the publisher handover to a new key."
+                        } else {
+                            "This update is signed by a new publisher key."
+                        }
+                    })
+                });
                 let mut body = version
                     .clone()
                     .map(|v| format!("Version {v} will replace the installed build."))
@@ -9916,6 +9945,37 @@ fn installed_size(app_id: &str, user_scope: bool) -> Option<String> {
         .map(String::from)
 }
 
+/// Parse an `orchard://` deep link. `orchard://app/<id>` (or the
+/// bare `orchard://<id>`) selects an app page; a `?publisher=<key>`
+/// query names the twin whose artifact the page shows. Anything
+/// malformed is None: a bad link never opens a page.
+fn parse_deep_link(url: &str) -> Option<(String, Option<String>)> {
+    let rest = url.strip_prefix("orchard://")?;
+    // the query carries the publisher; the fragment never means anything
+    let (path, query) = match rest.split_once('?') {
+        Some((path, query)) => (path, Some(query)),
+        None => (rest, None),
+    };
+    let path = path.trim_end_matches('/');
+    let id = match path.split_once('/') {
+        Some(("app", id)) => id,
+        Some(_) => return None,
+        None => path,
+    };
+    // flatpak app ids carry at least one dot; a link without one is
+    // not an app page (and never a command: nothing here executes)
+    if !id.contains('.') {
+        return None;
+    }
+    let publisher = query.and_then(|query| {
+        query.split('&').find_map(|pair| {
+            let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+            (key == "publisher" && !value.is_empty()).then(|| value.to_string())
+        })
+    });
+    Some((id.to_string(), publisher))
+}
+
 /// True when the remote's version is strictly newer than the
 /// installed one. Dot components compare numerically; anything
 /// non-numeric is inconclusive and reads as up to date: flatpak's
@@ -9943,6 +10003,14 @@ fn version_outdated(installed: &str, available: &str) -> bool {
     }
 }
 
+/// True when a row's publisher is the authorized successor of the key
+/// that installed the app: the recorded installer signed a migration
+/// naming this publisher. The row carries that statement as
+/// `successor_to`, so the fact needs no event replay.
+fn handover_authorized(app: &StoreApp, from: &str) -> bool {
+    app.successor_to.as_deref() == Some(from)
+}
+
 /// Update-available detection for one app: the deployed branch must
 /// match the row's channel (same-branch updates only), both versions
 /// must be known, and the remote's strictly newer by the numeric rule.
@@ -9964,8 +10032,46 @@ mod tests {
     use orchard_core::{CatalogApp, Publisher};
 
     #[test]
-    fn digest_cache_round_trips() {
-        let path =
+    fn deep_links_parse_and_reject() {
+        // the canonical form, bare and with a publisher twin
+        assert_eq!(
+            parse_deep_link("orchard://app/rocks.orchard.Hello"),
+            Some(("rocks.orchard.Hello".into(), None))
+        );
+        assert_eq!(
+            parse_deep_link("orchard://app/rocks.orchard.Hello?publisher=abc123"),
+            Some(("rocks.orchard.Hello".into(), Some("abc123".into())))
+        );
+        // the short form and a trailing slash work too
+        assert_eq!(
+            parse_deep_link("orchard://rocks.orchard.Hello/"),
+            Some(("rocks.orchard.Hello".into(), None))
+        );
+        // not a scheme, not an app id, unknown path: nothing opens
+        assert_eq!(parse_deep_link("https://orchard.rocks/app/x.y.Z"), None);
+        assert_eq!(parse_deep_link("orchard://app/nodot"), None);
+        assert_eq!(parse_deep_link("orchard://runtime/org.freedesktop.Platform"), None);
+        // a publisher-less empty query is still a plain app link
+        assert_eq!(
+            parse_deep_link("orchard://app/x.y.Z?publisher="),
+            Some(("x.y.Z".into(), None))
+        );
+    }
+
+    #[test]
+    fn handovers_authorize_the_recorded_predecessor() {
+        let mut app = StoreApp::from_catalog(&catalog_fixture("App", 0));
+        // the fixture row has no handover: a key change stays a change
+        assert!(!handover_authorized(&app, "k"));
+        // the row's successor_to is the old key's signed migration:
+        // an update from exactly that key is authorized
+        app.successor_to = Some("k".into());
+        assert!(handover_authorized(&app, "k"));
+        assert!(!handover_authorized(&app, "other"));
+    }
+
+    #[test]
+    fn digest_cache_round_trips() {        let path =
             std::env::temp_dir().join(format!("orchard-digests-{}.json", std::process::id()));
         let _ = std::fs::remove_file(&path);
         let mut cache = load_digest_cache_at(&path);
