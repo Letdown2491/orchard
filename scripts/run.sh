@@ -6,11 +6,15 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 export LD_LIBRARY_PATH="$PWD/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-# The dev loop reads and writes the demo relay on this machine. Set it
-# to empty (ORCHARD_RELAYS= ./scripts/run.sh) to exercise the shipped
-# default (the public rendezvous set) instead: the client treats a
-# blank value as no override.
-export ORCHARD_RELAYS="${ORCHARD_RELAYS-ws://127.0.0.1:8008}"
+# The client's shipped default is the public rendezvous set. Point
+# the dev loop at the local demo relay explicitly when you want it:
+#   ORCHARD_RELAYS=ws://127.0.0.1:8008 ./scripts/run.sh
+# An unset value inherits the shipped default; blank means the same
+# thing (the client treats a blank value as no override). Publishing
+# lands on the public relays regardless, so a dev run against only
+# the local relay sees a month-stale catalog that looks like a
+# sorting bug (the 2026-11-07 lesson).
+export ORCHARD_RELAYS
 # A dead relay fails silently: the client retries forever and the UI
 # shows confidently stale catalog data (the 2026-11-07 lesson). Warn
 # at launch when a configured relay is not accepting connections.

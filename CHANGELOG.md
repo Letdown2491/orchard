@@ -15,9 +15,12 @@
   list in push order (newest first) instead of alphabetically. Reviewed
   (Flathub) rows rank at their date's midnight, so they still interleave
   by day.
-- **`run.sh` warns on an unreachable relay at launch.** A dead relay
-  used to fail silently: the client retried forever and the UI showed
-  confidently stale catalog data.
+- **`run.sh` warns on an unreachable relay at launch** and no longer
+  points dev runs at the local demo relay by default: the shipped
+  public rendezvous set is the default, and the local relay is opt-in
+  (`ORCHARD_RELAYS=ws://127.0.0.1:8008 ./scripts/run.sh`). A dead
+  relay used to fail silently, and a dev run against the local relay
+  alone showed a month-stale catalog that looked like a sorting bug.
 
 ## v0.4.0 (2026-11-03)
 
