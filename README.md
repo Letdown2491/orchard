@@ -87,14 +87,15 @@ The host has no toolchain; everything builds in a container via
     ./scripts/run.sh
 
 (Run through `run.sh`, not the binary directly: it sets the library
-path the GPUI shell needs and pins the dev relay.)
+path the GPUI shell needs and warns at launch when a configured relay
+is unreachable.)
 
 Out of the box the client browses and installs the real Flathub catalog.
 The Orchard channel lists the real releases from the rendezvous relays,
 Orchard itself among them; see `PUBLISHING.md` to become a publisher.
-(By default `run.sh` pins the demo relay on this machine; run it as
-`ORCHARD_RELAYS= ./scripts/run.sh` to exercise the shipped public relay
-set instead.)
+(`run.sh` inherits the client's default, the public rendezvous set; run
+it as `ORCHARD_RELAYS=ws://127.0.0.1:8008 ./scripts/run.sh` to point
+the dev loop at the local demo relay instead.)
 
 ## Self-publishing
 
