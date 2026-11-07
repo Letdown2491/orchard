@@ -16,7 +16,7 @@ version = "0.4.1"
 arch = "linux-x86_64"
 # Every declared platform must be present in the combined release.
 platforms = ["linux-x86_64", "linux-aarch64"]
-notes = "Multi-channel releases: publishers may ship beta (or any named) channel beside stable; the client shows a channel flag on rows, a channel dropdown on the app page, and deploys channels in parallel. Install errors open a copyable dialog for bug reports. orchard:// links open app pages. An update that completes a signed publisher handover says so instead of warning about a new key."
+notes = "Reliability release: each catalog stream anchors its reconnect on its own kinds, so a chatty review can no longer blind the client to new releases; the Updated sort ranks on the newest arrived release's signed time, with same-day pushes listed newest first; the dev launcher warns at startup when a relay is unreachable."
 
 [artifact]
 tree = "tree"
