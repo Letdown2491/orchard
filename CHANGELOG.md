@@ -1,5 +1,24 @@
 # Changelog
 
+## v0.4.1 (2026-11-07)
+
+- **Per-stream reconnect anchors.** The structural catalog kinds
+  (listings, releases, assets, migrations) and reviews now subscribe as
+  separate streams, each anchoring its reconnect `since` on the newest
+  event of its own kinds. One shared anchor meant a single fresh review
+  could push it past catalog events the feed had never seen, and a
+  reconnect then skipped them forever until a cache-clear refill.
+- **Same-day push order in the Updated sort.** The list's recency sort
+  ranks on the newest *arrived* release's signed time, not the
+  installable pick's: a release that builds nothing for this machine no
+  longer drags the row's date back, and two apps pushed the same day
+  list in push order (newest first) instead of alphabetically. Reviewed
+  (Flathub) rows rank at their date's midnight, so they still interleave
+  by day.
+- **`run.sh` warns on an unreachable relay at launch.** A dead relay
+  used to fail silently: the client retried forever and the UI showed
+  confidently stale catalog data.
+
 ## v0.4.0 (2026-11-03)
 
 - **Multi-channel releases.** A publisher is no longer required to build

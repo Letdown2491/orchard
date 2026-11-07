@@ -315,9 +315,14 @@ impl Feed {
         )
     }
 
-    /// The newest event time the feed holds, across every kind: the
-    /// reconnect `since` anchor.
-    pub fn newest_created_at(&self) -> Option<u64> {
+    /// The newest structural event time the feed holds (listings,
+    /// releases, assets, migrations): the catalog stream's reconnect
+    /// `since` anchor. Kept apart from reviews so one chatty kind
+    /// cannot push the other stream's anchor past events it has not
+    /// seen: a review newer than everything else used to lift the one
+    /// shared anchor, and a reconnect then skipped catalog events
+    /// older than it forever.
+    pub fn newest_catalog_created_at(&self) -> Option<u64> {
         [
             self.listings.values().map(|l| l.created_at).max(),
             self.migrations.values().map(|m| m.created_at).max(),
@@ -327,8 +332,25 @@ impl Feed {
                 .map(|r| r.created_at)
                 .max(),
             self.assets.values().map(|a| a.created_at).max(),
+        ]
+        .into_iter()
+        .flatten()
+        .max()
+    }
+
+    /// The newest review time the feed holds: the review stream's own
+    /// reconnect anchor, for the same reason the structural kinds
+    /// keep theirs.
+    pub fn newest_review_created_at(&self) -> Option<u64> {
+        self.reviews.values().map(|r| r.created_at).max()
+    }
+
+    /// The newest event time the feed holds, across every kind.
+    pub fn newest_created_at(&self) -> Option<u64> {
+        [
+            self.newest_catalog_created_at(),
+            self.newest_review_created_at(),
             self.profiles.values().map(|p| p.created_at).max(),
-            self.reviews.values().map(|r| r.created_at).max(),
         ]
         .into_iter()
         .flatten()
@@ -867,6 +889,23 @@ impl Feed {
                 // install. The claimed platforms ride the row.
                 None => (String::new(), None, String::new()),
             };
+            // the row's update time is the newest arrived release this
+            // publisher signed, not the installable pick's: a release
+            // that builds nothing for this machine (or whose assets
+            // have not landed yet) still happened, and the list must
+            // rank it as an update rather than silently falling back
+            // to the previous installable release's date
+            let published_at = self
+                .releases
+                .get(app_id)
+                .and_then(|releases| {
+                    releases
+                        .iter()
+                        .filter(|r| r.publisher == *author)
+                        .map(|r| r.created_at as i64)
+                        .max()
+                })
+                .unwrap_or(release.created_at as i64);
             let ref_arch = platform.strip_prefix("linux-").unwrap_or(platform);
             // the candidate components of one release for this
             // publisher/platform, minus the flatpak blob itself
@@ -931,7 +970,7 @@ impl Feed {
                 homepage: listing.homepage.clone(),
                 notes: (!release.event.content.is_empty())
                     .then(|| release.event.content.clone()),
-                published_at: release.created_at as i64,
+                published_at,
                 // the newest statement naming this publisher as
                 // successor, if any: the row's handover is authorized
                 successor_to: self

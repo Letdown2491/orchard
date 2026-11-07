@@ -317,6 +317,10 @@ pub struct StoreApp {
     /// Platform tags the listing claims (publisher channel only).
     /// Empty: unknown or reviewed channel.
     pub platforms: Vec<String>,
+    /// The newest arrived release's signed event time, seconds since
+    /// the epoch (publisher channel only). Zero: no release, or the
+    /// reviewed channel (which carries a date, not a time).
+    pub published_at: i64,
     /// The default pick's deploy branch (publisher channel only):
     /// `stable`, or another channel's name. None: reviewed channel.
     pub branch: Option<String>,
@@ -351,6 +355,7 @@ impl StoreApp {
             oci_assets: None,
             successor_to: None,
             platforms: Vec::new(),
+            published_at: 0,
             branch: None,
             channels: Vec::new(),
         }
@@ -386,6 +391,7 @@ impl StoreApp {
             oci_assets: app.oci_assets.clone(),
             successor_to: app.successor_to.clone(),
             platforms: app.platforms.clone(),
+            published_at: app.published_at,
             branch: Some(app.branch.clone()),
             channels: app.channels.clone(),
         }

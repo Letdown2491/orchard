@@ -11,6 +11,25 @@ export LD_LIBRARY_PATH="$PWD/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 # default (the public rendezvous set) instead: the client treats a
 # blank value as no override.
 export ORCHARD_RELAYS="${ORCHARD_RELAYS-ws://127.0.0.1:8008}"
+# A dead relay fails silently: the client retries forever and the UI
+# shows confidently stale catalog data (the 2026-11-07 lesson). Warn
+# at launch when a configured relay is not accepting connections.
+for relay in ${ORCHARD_RELAYS//,/ }; do
+  host=${relay#*://}
+  host=${host%%/*}
+  if [[ "$host" == *:* ]]; then
+    port=${host##*:}
+  elif [[ "$relay" == wss://* ]]; then
+    port=443
+  else
+    port=80
+  fi
+  if ! timeout 2 bash -c "exec 3<>/dev/tcp/${host%%:*}/$port" 2>/dev/null; then
+    echo "WARNING: relay $relay is unreachable; the catalog will be" \
+      "stale until it comes back (ORCHARD_RELAYS= runs the shipped" \
+      "public set instead)" >&2
+  fi
+done
 # exec would lose it: the exit status is the only forensic trace of
 # a silent death. 0 is a clean exit (an in-code path to hunt), 137
 # SIGKILL, 143 SIGTERM (relaunch housekeeping), 139 a segfault.

@@ -8825,17 +8825,33 @@ fn ci_cmp(a: &str, b: &str) -> std::cmp::Ordering {
 /// boldest claim), and an app whose dates are all in the future ranks
 /// as undated: it sinks with the undated, name breaking ties, and
 /// rises by itself the day its date arrives. `today` is an ISO date.
+/// Within one day, the signed release time breaks the tie, so two
+/// apps pushed the same day list in push order, newest first. A
+/// reviewed row carries no time: it ranks at its date's midnight.
 fn date_order(a: &StoreApp, b: &StoreApp, today: &str) -> std::cmp::Ordering {
     // the claim stays on the app (the page shows it as "dated"), it
     // just does not rank until it is true. A fn, not a closure: the
     // return lifetime is the app's, not the captured `today`'s.
-    fn rank<'a>(app: &'a StoreApp, today: &str) -> Option<&'a str> {
+    fn rank<'a>(app: &'a StoreApp, today: &str) -> Option<(&'a str, i64)> {
         let date = app.release_date.as_deref()?;
-        (date <= today).then_some(date)
+        (date <= today).then(|| {
+            // a publisher row ranks at its signed time; a reviewed
+            // row, at its date's midnight, so it still interleaves
+            // with publisher rows by day
+            let time = if app.published_at > 0 {
+                app.published_at
+            } else {
+                date_midnight(date)
+            };
+            (date, time)
+        })
     }
     match (rank(b, today), rank(a, today)) {
         (Some(x), Some(y)) => x
-            .cmp(y)
+            .0
+            .cmp(y.0)
+            // same day: the later signature first
+            .then_with(|| x.1.cmp(&y.1))
             .then_with(|| ci_cmp(&a.name, &b.name)),
         // b dated, a undated: a sinks (undated apps sort last)
         (Some(_), None) => std::cmp::Ordering::Greater,
@@ -8843,6 +8859,29 @@ fn date_order(a: &StoreApp, b: &StoreApp, today: &str) -> std::cmp::Ordering {
         (None, Some(_)) => std::cmp::Ordering::Less,
         (None, None) => ci_cmp(&a.name, &b.name),
     }
+}
+
+/// Seconds since the epoch for `YYYY-MM-DD` at 00:00 UTC: the ranking
+/// fallback for rows that carry a release date but no release time.
+fn date_midnight(date: &str) -> i64 {
+    fn num(part: Option<&str>) -> i64 {
+        part.and_then(|p| p.parse::<i64>().ok()).unwrap_or(0)
+    }
+    let mut parts = date.split('-');
+    let year = num(parts.next());
+    let month = num(parts.next());
+    let day = num(parts.next());
+    if year == 0 || month == 0 || day == 0 || month > 14 || day > 31 {
+        return 0;
+    }
+    // days from civil (Howard Hinnant's algorithm), no calendar dep
+    let shifted_month = if month <= 2 { month + 12 } else { month };
+    let year = if month <= 2 { year - 1 } else { year };
+    let era = year.div_euclid(400);
+    let year_of_era = year - era * 400;
+    let day_of_year = (153 * (shifted_month - 3) + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    (era * 146_097 + day_of_era - 719_468) * 86_400
 }
 
 /// The catalog list order, persisted in settings: recency by
@@ -10285,6 +10324,27 @@ mod tests {
         // zero (no release) stays undated
         let app = StoreApp::from_catalog(&catalog_fixture("App", 0));
         assert_eq!(app.release_date, None);
+    }
+
+    #[test]
+    fn date_order_breaks_same_day_ties_by_signed_time() {
+        let today = "2026-10-11";
+        // two apps pushed the same day: push order, newest first,
+        // not the alphabetical tiebreak
+        let morning = StoreApp::from_catalog(&catalog_fixture("Aardvark", 1_791_711_263));
+        let evening = StoreApp::from_catalog(&catalog_fixture("Zebra", 1_791_714_863));
+        assert_eq!(
+            date_order(&evening, &morning, today),
+            std::cmp::Ordering::Less
+        );
+        // a reviewed row ranks at its date's midnight: still ordered
+        // by day against publisher rows, not lumped last
+        let mut reviewed = dated_app("Midlings", Some("2026-10-11"));
+        reviewed.published_at = 0;
+        assert_eq!(
+            date_order(&morning, &reviewed, today),
+            std::cmp::Ordering::Less
+        );
     }
 
     #[test]

@@ -83,17 +83,22 @@ pub fn social_relay_urls(env_value: Option<&str>) -> Vec<String> {
 
 /// NIP-82 kinds Orchard reads: profiles, listings, releases, assets,
 /// reviews, migrations.
-/// The kinds that build the catalog: listings, releases, assets,
-/// reviews, migrations. Each is one publisher community's output, a
-/// small corpus even on the public relays, so the pull stays
-/// unbounded and reaches its EOSE.
-const CATALOG_KINDS: [u16; 5] = [
+/// The structural catalog kinds: listings, releases, assets,
+/// migrations. Each is one publisher community's output, a small
+/// corpus even on the public relays, so the pull stays unbounded and
+/// reaches its EOSE.
+const STRUCTURAL_KINDS: [u16; 4] = [
     crate::KIND_APP as u16,
     crate::KIND_RELEASE as u16,
     crate::KIND_ASSET as u16,
-    crate::KIND_REVIEW as u16,
     crate::KIND_MIGRATION as u16,
 ];
+
+/// Reviews ride their own stream beside the structural kinds: the two
+/// anchor their reconnect `since` filters separately, so a chatty
+/// review stream can never push the structural anchor past releases
+/// the feed has not seen (and vice versa).
+const REVIEW_KINDS: [u16; 1] = [crate::KIND_REVIEW as u16];
 
 /// Profiles only decorate the catalog (publisher names and icons), but
 /// on the public relays kind 0 is the whole of Nostr: unbounded, it
@@ -132,24 +137,32 @@ fn backoff_delay(failures: u32) -> Duration {
 const SINCE_OVERLAP: u64 = 60 * 60;
 
 /// The subscription texts for one session, one REQ per stream: the
-/// catalog kinds, and the capped profile pull. Before the first full
-/// backfill the catalog stream asks for everything; after, only for
-/// events newer than the feed's newest (minus overlap), so a
-/// reconnect costs a delta instead of re-downloading and re-verifying
-/// the relay's whole history.
+/// structural catalog kinds, the reviews, and the capped profile
+/// pull. Each catalog-side stream anchors its `since` on the newest
+/// event *of its own kinds*: before the first full backfill the
+/// streams ask for everything; after, only for events newer than
+/// their own newest (minus overlap), so a reconnect costs a delta
+/// instead of re-downloading and re-verifying the relay's whole
+/// history. A shared anchor across kinds was the 2026-11-07 lesson:
+/// one fresh review used to blind the structural stream to releases.
 fn subscriptions(feed: &Feed, backfilled: bool) -> Vec<String> {
-    let mut catalog = serde_json::json!({ "kinds": CATALOG_KINDS });
-    if backfilled
-        && let Some(newest) = feed.newest_created_at()
-    {
-        catalog["since"] = serde_json::json!(newest.saturating_sub(SINCE_OVERLAP));
+    let mut structural = serde_json::json!({ "kinds": STRUCTURAL_KINDS });
+    let mut reviews = serde_json::json!({ "kinds": REVIEW_KINDS });
+    if backfilled {
+        if let Some(newest) = feed.newest_catalog_created_at() {
+            structural["since"] = serde_json::json!(newest.saturating_sub(SINCE_OVERLAP));
+        }
+        if let Some(newest) = feed.newest_review_created_at() {
+            reviews["since"] = serde_json::json!(newest.saturating_sub(SINCE_OVERLAP));
+        }
     }
     let profiles = serde_json::json!({
         "kinds": [crate::KIND_PROFILE as u16],
         "limit": PROFILE_LIMIT,
     });
     vec![
-        serde_json::json!(["REQ", "orchard", catalog]).to_string(),
+        serde_json::json!(["REQ", "orchard", structural]).to_string(),
+        serde_json::json!(["REQ", "orchard-reviews", reviews]).to_string(),
         serde_json::json!(["REQ", "orchard-profiles", profiles]).to_string(),
     ]
 }
@@ -601,27 +614,34 @@ mod tests {
             .unwrap()
     }
 
-    /// Before a full backfill the subscription asks for everything.
+    /// Before a full backfill the streams ask for everything.
     #[test]
     fn subscription_asks_for_everything_before_backfill() {
         let feed = Feed::new();
         let subs = subscriptions(&feed, false);
-        // the catalog stream first, the capped profile stream second
+        // structural first, then reviews, then the capped profiles
         assert!(!subs[0].contains("since"));
         assert!(!subs[1].contains("since"));
+        assert!(!subs[2].contains("since"));
     }
 
-    /// The catalog stream never asks for profiles, and the profile
-    /// stream is capped: on the public relays kind 0 is unbounded and
-    /// would drown the catalog kinds behind it.
+    /// The structural stream never asks for reviews or profiles, and
+    /// the profile stream is capped: on the public relays kind 0 is
+    /// unbounded and would drown the catalog kinds behind it.
     #[test]
     fn subscription_splits_catalog_from_capped_profiles() {
         let feed = Feed::new();
         let subs = subscriptions(&feed, false);
-        let catalog: serde_json::Value = serde_json::from_str(&subs[0]).unwrap();
-        let profiles: serde_json::Value = serde_json::from_str(&subs[1]).unwrap();
-        let kinds = catalog[2]["kinds"].as_array().unwrap();
+        let structural: serde_json::Value = serde_json::from_str(&subs[0]).unwrap();
+        let reviews: serde_json::Value = serde_json::from_str(&subs[1]).unwrap();
+        let profiles: serde_json::Value = serde_json::from_str(&subs[2]).unwrap();
+        let kinds = structural[2]["kinds"].as_array().unwrap();
         assert!(!kinds.iter().any(|k| k.as_u64() == Some(0)));
+        assert!(!kinds
+            .iter()
+            .any(|k| k.as_u64() == Some(crate::KIND_REVIEW as u64)));
+        assert_eq!(reviews[1].as_str(), Some("orchard-reviews"));
+        assert_eq!(reviews[2]["kinds"][0].as_u64(), Some(crate::KIND_REVIEW as u64));
         assert_eq!(profiles[1].as_str(), Some("orchard-profiles"));
         assert_eq!(profiles[2]["limit"].as_u64(), Some(PROFILE_LIMIT as u64));
         assert_eq!(profiles[2]["kinds"][0].as_u64(), Some(0));
@@ -659,6 +679,45 @@ mod tests {
         );
         // the same feed, pre-backfill, still carries no filter
         assert!(!subscriptions(&feed, false)[0].contains("since"));
+    }
+
+    /// Each stream anchors on its own kinds' newest: a review must
+    /// not lift the structural anchor (a reconnect would then skip
+    /// releases the feed never saw) and a listing must not lift the
+    /// review anchor.
+    #[test]
+    fn subscription_anchors_streams_independently() {
+        let keys = Keys::generate();
+        let mut feed = Feed::new();
+        feed.absorb(signed(
+            &keys,
+            crate::KIND_APP,
+            "A listing.",
+            vec![("d", "com.example.Hello"), ("f", "linux-x86_64")],
+        ))
+        .unwrap();
+        feed.absorb(signed(
+            &keys,
+            crate::KIND_REVIEW,
+            "A rave.",
+            vec![("d", "com.example.Hello")],
+        ))
+        .unwrap();
+        let listing_newest = feed.newest_catalog_created_at().unwrap();
+        let review_newest = feed.newest_review_created_at().unwrap();
+
+        let structural: serde_json::Value =
+            serde_json::from_str(&subscriptions(&feed, true)[0]).unwrap();
+        assert_eq!(
+            structural[2]["since"].as_u64(),
+            Some(listing_newest.saturating_sub(SINCE_OVERLAP))
+        );
+        let reviews: serde_json::Value =
+            serde_json::from_str(&subscriptions(&feed, true)[1]).unwrap();
+        assert_eq!(
+            reviews[2]["since"].as_u64(),
+            Some(review_newest.saturating_sub(SINCE_OVERLAP))
+        );
     }
 
     /// The reconnect delay doubles per consecutive miss and caps, so
