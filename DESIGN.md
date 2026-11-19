@@ -161,7 +161,16 @@ Zapstore publishers readable on Orchard day one:
   Third-party publishers may omit the legacy location, deliberately requiring
   a component-aware client (0.3.0 or later) for OCI installation. v0.2.0 cannot
   install those component-only releases; native Flatpak bundles are unaffected.
-  If other publishers do not adopt `T`, it remains an Orchard convention.
+  `T` is a shared convention now: ngit ships it as of its 2026-11
+  release, so the exact spelling `flatpak-oci`
+  (`orchard-core/src/oci_asset.rs`) is the interop contract; a spelling
+  drift would silently un-install every Flatpak target ngit publishes.
+  The cross-implementation rule: an unrecognized or absent `T` means the
+  asset is not a Flatpak target (skipped for install, kept for display),
+  and absence of any installable target still lists the row with no
+  install. Older asset shapes keep their own disambiguation and need no
+  `T` (registry `oci:`/`docker://` locations, Flatpak MIME or bundle
+  filename).
   Unknown tags need not prevent other clients from reading compatible assets,
   but MIME and platform alone cannot distinguish Flatpak OCI from other OCI
   targets. Orchard does not infer a Flatpak target for untagged component graphs.
