@@ -1,0 +1,42 @@
+# The publish manifest template (issue #9). Copy this directory into
+# your app repo, rename the app, fill the registry and relays, and wire
+# the caller workflow (see caller-workflow.yml beside this file). Every
+# field's meaning is in PUBLISHING.md; the demo's live twin is
+# demo/hello.publish.toml.
+
+[app]
+# The flatpak app id: reverse-DNS, and the publisher's key signs it.
+id = "com.example.MyApp"
+name = "My App"
+summary = "One line, shown in listings"
+description = "Shown on the app page. Plain text."
+categories = ["Utility"]
+# Where the source lives; --prove commits the repository proof here.
+repository = "https://github.com/owner/myapp"
+# Optional: a square PNG URL, shown in listings. The app page falls
+# back to the mark without one.
+icon = "https://raw.githubusercontent.com/owner/myapp/main/icon.png"
+
+[release]
+# The version your users see; every publish bumps it.
+version = "1.0.0"
+arch = "linux-x86_64"
+# The flatpak runtime the app needs. Flathub-hosted runtimes are the
+# default convention (orchard serves apps, flathub serves runtimes):
+# users need flathub enabled, which flatpak resolves on install.
+runtime = "org.freedesktop.Platform/x86_64/25.08"
+notes = "What changed in this release."
+
+[artifact]
+# The app tree, relative to this manifest: metadata, files/, export/.
+# See the tree beside this file; assemble whatever the app needs into
+# files/ before publish (the caller workflow is where your build runs).
+tree = "tree"
+
+[publish]
+# relay.orchard.rocks is the required relay (orchard-publish refuses a
+# publish without it); the rest are your choice of public relays.
+relays = ["wss://relay.orchard.rocks", "wss://relay.primal.net", "wss://nos.lol"]
+tag = "latest"
+# Optional: the publisher profile shown on the app page (kind 0).
+author-name = "My Name"

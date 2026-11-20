@@ -1,0 +1,27 @@
+# Copy to .github/workflows/publish.yml in your app repo. Publishes on
+# every version tag: builds nothing (your app is assembled in the tree
+# already, or add your own build step before this one), pushes the OCI
+# artifact, attaches the oci-archive to the release, and signs the
+# NIP-82 events pinning the digests.
+#
+# Secrets to set in your repo:
+#   ORCHARD_NSEC  your publisher identity's secret key (nsec hex)
+
+name: publish
+
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  publish:
+    uses: Letdown2491/orchard/.github/workflows/orchard-publish.yml@v0.5.0
+    with:
+      manifest-path: app.publish.toml
+      matrix: '{"include":[{"arch":"linux-x86_64","runner":"ubuntu-latest"}]}'
+      registry: ghcr.io/owner/myapp
+      # Pin the Orchard ref the publisher builds from: only bump it
+      # deliberately.
+      orchard-ref: v0.5.0
+    secrets:
+      ORCHARD_NSEC: ${{ secrets.ORCHARD_NSEC }}

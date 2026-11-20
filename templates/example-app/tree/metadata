@@ -1,0 +1,7 @@
+[Application]
+name=com.example.MyApp
+runtime=org.freedesktop.Platform/x86_64/25.08
+command=my-app
+
+[Context]
+sockets=wayland;
