@@ -10,7 +10,7 @@ id = "com.example.MyApp"
 name = "My App"
 summary = "One line, shown in listings"
 description = "Shown on the app page. Plain text."
-categories = ["Utility"]
+categories = ["Utilities"]
 # Where the source lives; --prove commits the repository proof here.
 repository = "https://github.com/owner/myapp"
 # Optional: a square PNG URL, shown in listings. The app page falls
@@ -21,10 +21,9 @@ icon = "https://raw.githubusercontent.com/owner/myapp/main/icon.png"
 # The version your users see; every publish bumps it.
 version = "1.0.0"
 arch = "linux-x86_64"
-# The flatpak runtime the app needs. Flathub-hosted runtimes are the
-# default convention (orchard serves apps, flathub serves runtimes):
-# users need flathub enabled, which flatpak resolves on install.
-runtime = "org.freedesktop.Platform/x86_64/25.08"
+# The flatpak runtime comes from the app tree's metadata ini
+# ([Application] runtime=), which the client reads from the artifact
+# and pre-flights; it is not declared here.
 notes = "What changed in this release."
 
 [artifact]

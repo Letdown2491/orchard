@@ -219,6 +219,7 @@ outgrew the box.
 - **The dev relay** (`orchard-relay` podman container,
   `ws://127.0.0.1:8008`) runs this same config with dev values
   (identities localhost, no rate limits so test loops run free),
-  applied with `podman cp` into the container layer plus a restart.
-  Its database also lives in the container layer: both survive
-  `podman restart`, neither survives `podman rm`.
+  bind-mounted from the repo's `relay/config.toml`: the file is the
+  source of truth, and a restart applies its edits. Its database lives
+  in the container layer: it survives `podman restart`, not
+  `podman rm`.

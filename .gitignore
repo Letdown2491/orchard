@@ -8,3 +8,5 @@
 /tmp/
 packaging/apk/out/
 packaging/arch/out/
+# python bytecode
+relay/__pycache__/

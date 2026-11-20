@@ -15,13 +15,13 @@ on:
 
 jobs:
   publish:
-    uses: Letdown2491/orchard/.github/workflows/orchard-publish.yml@v0.5.0
+    uses: Letdown2491/orchard/.github/workflows/orchard-publish.yml@v0.5.1
     with:
       manifest-path: app.publish.toml
       matrix: '{"include":[{"arch":"linux-x86_64","runner":"ubuntu-latest"}]}'
       registry: ghcr.io/owner/myapp
       # Pin the Orchard ref the publisher builds from: only bump it
       # deliberately.
-      orchard-ref: v0.5.0
+      orchard-ref: v0.5.1
     secrets:
       ORCHARD_NSEC: ${{ secrets.ORCHARD_NSEC }}

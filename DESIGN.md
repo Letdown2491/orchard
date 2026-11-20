@@ -1,6 +1,6 @@
 # Orchard design
 
-**Status:** draft v0.4 · 2026-10-12
+**Status:** draft v0.5 · 2026-11-20
 
 **Pitch:** Orchard is a permissionless Flatpak store. Developers publish apps directly to
 their own OCI registries; Nostr carries discovery, identity, releases, and reviews; the
@@ -130,7 +130,10 @@ distribution infrastructure stays at zero central servers.
   events. The layer and gzip are deterministic, so the same tree builds to the same
   digest. Registry pushes speak the Docker v2 bearer-token dance (anonymous or basic
   auth); the proof-file write accepts 201 and 200. CI (`self-publish.yml`) runs on a `v*` tag, builds in the dev image, and
-  takes the release version from the tag.
+  takes the release version from the tag. The same publish path is a reusable
+  workflow any app repo consumes with one `uses:` job (issue #9); `release.yml`
+  builds the native packages (deb, rpm, apk, Arch pkg, both arches) beside the
+  oci-archive, and every release artifact wears a minisign signature (issue #8).
 
 ## Nostr protocol (NIP-82 draft, Zapstore-compatible)
 
@@ -297,7 +300,10 @@ signed" into "operator attests", a model change dressed as a feature.
   compose before it closes the page. An existing review pre-fills (caret at the end)
   and the invitation reads "Edit your review".
 - **Settings:** Sources, Relays (event and social sets, editable, reset to the
-  rendezvous set), Updates cadence, Privacy (remote images, cache clears). Settings
+  rendezvous set; live health badges, live / quiet Nm / down retrying, fed by
+  indexd's `GET /v1/relays` on the 30s cadence, with a "relays unreachable"
+  footer warning when every tracked relay is disconnected), Updates cadence,
+  Privacy (remote images, cache clears). Settings
   live in `~/.config/orchard/settings.json` behind a handle shared with indexd, so
   edits persist atomically and apply live (relay edits within a second). Precedence:
   environment beats file beats defaults. Trust-relevant behavior is never configurable.
@@ -369,7 +375,7 @@ sandbox; bump the pin with the runtime the publish manifest targets, and wipe
 | M4 | Permissions viewer (built, reads the real sandbox from the artifact); `orchard://` scheme handler | done |
 | M5 | Publish CLI: manifest → build → push → sign → events, proven live against a TLS registry | done |
 | M6 | Reviews, review trust, circle + two-hop graph, self-distribution (Orchard publishes itself through the ordinary path), rendezvous topology | code complete 2026-10-11 |
-| M7 | The public loop: tags ship through CI to ghcr, install and update through the GUI | v0.1.0 through v0.5.0 shipped; the 0.3.0 to 0.4.0 self-update proven live 2026-11-04 |
+| M7 | The public loop: tags ship through CI to ghcr, install and update through the GUI | v0.1.0 through v0.5.1 shipped; the 0.3.0 to 0.4.0 self-update proven live 2026-11-04 |
 | M8 | Headless CLI on the multiplexed binary: job engine extraction, search/info/install/update/remove/list, relays | design agreed 2026-10-21 |
 
 **M7 open items:**

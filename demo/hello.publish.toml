@@ -15,7 +15,8 @@ categories = ["Utilities"]
 [release]
 version = "1.4.0"
 arch = "linux-x86_64"
-runtime = "org.freedesktop.Platform/x86_64/25.08"
+# the runtime the client pre-flights comes from the tree's metadata
+# ini, not this file (a [release] runtime key would be silently ignored)
 notes = "Seam prototype release: exercises the flatpak update path."
 
 [artifact]
