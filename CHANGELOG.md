@@ -1,5 +1,33 @@
 # Changelog
 
+## v0.5.2 (2026-11-20)
+
+- **The catalog is browsable on the web (issue #13).** A hosted indexer
+  now serves one read-only, server-rendered page set beside its API:
+  the app list at `/apps` and a detail view per app. No framework, no
+  client-side JavaScript, no write path. The detail page carries the
+  description, category chips, screenshots (a CSS-only horizontal
+  strip), reviews with count and average, the digest pin, and the
+  `remote-add` and `flatpak install` commands, so a shareable link is
+  all it takes to point someone at an app. The palette follows the
+  visitor's system theme with the app's dark greens, every
+  publisher-controlled field is HTML-escaped, and pages carry an ETag
+  with `no-cache`, so a stale copy can never render and an unchanged
+  page costs a 304.
+- **Fixed: installs through a hosted remote failed with 403.** The
+  indexd `/v2` proxy sent the registry token as a bare credential
+  without the `Bearer` scheme after the token dance, which ghcr
+  answers 403. Installs through the GUI's in-process path worked; every
+  install through a hosted indexer did not.
+- **Fixed: a hosted daemon could not start on a fresh box.** The
+  standalone runner exited when no catalog file existed, but a hosted
+  deployment legitimately starts empty: the relays are the source of
+  truth and verified events merge over the base within seconds. An
+  explicitly named missing file is still an error.
+- **Proxy failures log their error chains.** The two silent paths in
+  the registry dance now print what failed, so a hosted operator sees
+  a reason in the journal instead of a bare 502.
+
 ## v0.5.1 (2026-11-20)
 
 - **Corrected release notes.** The v0.5.0 tag froze the self manifest
