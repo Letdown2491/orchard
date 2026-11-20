@@ -72,11 +72,9 @@ on:
       MINISIGN_SECRET_KEY:
         description: Optional minisign key (issue #8): the release's oci-archive wears a .minisig
         required: false
-        default: ""
       REGISTRY_USER:
         description: Registry login; ghcr needs ${{ github.actor }}; GITHUB_TOKEN works
         required: false
-        default: ""
       REGISTRY_PASSWORD:
         description: Registry password/token
         required: false
