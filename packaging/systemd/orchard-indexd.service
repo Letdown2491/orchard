@@ -6,6 +6,19 @@
 #   flatpak remote-add --if-not-exists orchard \
 #     oci+https://index.example.com
 #
+# Hosting notes (from the apps.orchard.rocks deployment, 2026-11-20):
+# - The daemon starts with an empty catalog if no file exists: the
+#   relays are the source of truth and verified events merge over the
+#   base within seconds of startup. No seed file is needed.
+# - Ship a static binary (musl): cargo build -p orchard-indexd
+#   --target x86_64-unknown-linux-musl with musl-gcc as the target CC.
+# - Reverse-proxy a dedicated subdomain (not a subpath) with TLS and
+#   response buffering off; Caddy's `reverse_proxy` + flush_interval -1
+#   is the whole config. DNS must resolve before the proxy first
+#   starts, or Caddy downgrades the host to HTTP-only until reloaded.
+# - On a small box (1 GB RAM), add a 1 GB swapfile; indexd idles at
+#   ~15 MB RSS but a first-sync burst is worth insuring against.
+#
 # Unit file install (user):
 #   mkdir -p ~/.config/systemd/user
 #   cp packaging/systemd/orchard-indexd.service ~/.config/systemd/user/
