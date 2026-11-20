@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.5.3 (2026-11-20)
+
+- **Fixed: proxied manifest fetches 404 after the token dance.** The
+  v2 proxy's retry after the bearer-token exchange dropped the Accept
+  header, and ghcr answers a manifest GET that names no manifest media
+  type with 404. The initial request carried the types; the retry
+  carries them too now. This is the last piece the 0.5.2 hosted-install
+  fix needed: 403 (bare credential) fixed there, 404 (missing Accept)
+  fixed here, verified end to end against ghcr.
+
 ## v0.5.2 (2026-11-20)
 
 - **The catalog is browsable on the web (issue #13).** A hosted indexer
