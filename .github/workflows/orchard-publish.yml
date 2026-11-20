@@ -78,6 +78,13 @@ on:
       REGISTRY_PASSWORD:
         description: Registry password/token
         required: false
+  # GitHub's push-time validation creates runs for this file no matter
+  # what (opaque 0-second failures for a workflow_call-only file), so
+  # declare the push trigger and make those runs green no-ops: the job
+  # guard skips everything, and the matrix fallback keeps the strategy
+  # expression evaluable where `inputs` is empty.
+  push:
+    branches: [main]
 
 permissions:
   contents: write
@@ -85,9 +92,11 @@ permissions:
 
 jobs:
   prepare:
+    # the publish path is callable-only; push runs are validation no-ops
+    if: github.event_name == 'workflow_call'
     strategy:
       fail-fast: false
-      matrix: ${{ fromJSON(inputs.matrix) }}
+      matrix: ${{ fromJSON(inputs.matrix || '{"include":[{"runner":"ubuntu-latest"}]}') }}
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
@@ -165,6 +174,8 @@ jobs:
 
   publish:
     needs: prepare
+    # the publish path is callable-only; push runs are validation no-ops
+    if: github.event_name == 'workflow_call'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
