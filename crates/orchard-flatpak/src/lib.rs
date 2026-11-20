@@ -74,14 +74,36 @@ pub fn ensure_oci_remote(index_url: &str) -> Command {
     cmd
 }
 
+/// Whether the Orchard remote is registered in the user installation.
+/// The client's startup registration runs off-thread; an install that
+/// arrives before it has landed asks for it synchronously (idempotent
+/// with `--if-not-exists`), so the remote-path install never races it.
+pub fn oci_remote_registered() -> bool {
+    list_remotes()
+        .output()
+        .map(|out| {
+            parse_remotes(&String::from_utf8_lossy(&out.stdout))
+                .iter()
+                .any(|remote| remote.name == REMOTE_NAME)
+        })
+        .unwrap_or(false)
+}
+
 /// Install a ref from a classic remote, e.g.
 /// `flatpak install --system -y flathub org.gnome.Polari` or a
 /// runtime branch (`runtime/org.freedesktop.Platform/x86_64/26.08`).
 /// The scope must be one hosting the remote: a user-install-only
 /// remote is unknown to the system installation and vice versa.
-pub fn install_ref(ref_: &str, remote: &str, scope: Scope) -> Command {
+pub fn install_ref(ref_: &str, remote: &str, scope: Scope, no_deps: bool) -> Command {
     let mut cmd = flatpak_command();
-    cmd.args(["install", scope.flag(), "-y", remote, ref_]);
+    cmd.args(["install", scope.flag(), "-y"]);
+    // --no-deps: the runtime is deployed system-scope only, and a user
+    // install runs a system runtime fine; letting flatpak resolve deps
+    // would pull a second (user-scope) copy of it
+    if no_deps {
+        cmd.arg("--no-deps");
+    }
+    cmd.args([remote, ref_]);
     cmd
 }
 
@@ -474,7 +496,7 @@ mod tests {
     #[test]
     fn install_ref_builds_expected_invocation() {
         for (scope, flag) in [(Scope::System, "--system"), (Scope::User, "--user")] {
-            let cmd = install_ref("org.gnome.Polari", "flathub", scope);
+            let cmd = install_ref("org.gnome.Polari", "flathub", scope, false);
             let args = arg_strings(&cmd);
             let tail: Vec<String> = args.iter().skip(args.len() - 5).cloned().collect();
             assert_eq!(
@@ -482,6 +504,15 @@ mod tests {
                 ["install", flag, "-y", "flathub", "org.gnome.Polari"]
             );
         }
+    }
+
+    #[test]
+    fn install_ref_no_deps_flag() {
+        let cmd = install_ref("app/x/x86_64/stable", "orchard", Scope::User, true);
+        let args = arg_strings(&cmd);
+        assert!(args.contains(&"--no-deps".to_string()));
+        let cmd = install_ref("app/x/x86_64/stable", "orchard", Scope::User, false);
+        assert!(!arg_strings(&cmd).contains(&"--no-deps".to_string()));
     }
 
     #[test]

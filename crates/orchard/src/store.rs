@@ -2425,8 +2425,12 @@ impl StoreRoot {
         match app.source {
             Source::Reviewed => {
                 let channel = self.channel_for(app.remote.as_deref());
-                let cmd =
-                    orchard_flatpak::install_ref(&app.app_id, &channel.remote, channel_scope(&channel));
+                let cmd = orchard_flatpak::install_ref(
+                    &app.app_id,
+                    &channel.remote,
+                    channel_scope(&channel),
+                    false,
+                );
                 self.jobs
                     .insert(app.app_id.clone(), Job::new(JobState::Installing));
                 self.run_job(cmd, &app.app_id, "Install", &channel.remote, cx);
@@ -2516,11 +2520,48 @@ impl StoreRoot {
             .insert(app.app_id.clone(), Job::new(JobState::Verifying));
         cx.notify();
 
+        // The remote path (issue #7): a registry-addressed image
+        // installs from the registered flatpak remote, the classic
+        // way. Bundles (https artifacts) and local layouts stay on the
+        // direct path: bundles are a client-only channel by rule, and
+        // a layout needs no remote.
+        let remote_install = matches!(
+            location,
+            oci::Location::Registry { .. } | oci::Location::ManifestUrl(_)
+        );
+
         cx.spawn(async move |this, cx| {
             let pinned = app.pinned_digest.clone();
             let mut app = app;
             let assets = app.oci_assets.clone();
-            let report = if assets.is_none() && matches!(location, oci::Location::Https { .. }) {
+            let report = if remote_install {
+                // No fetch, no client-side digest pass: the pin rides
+                // the verified event, the metadata rides the row, and
+                // flatpak re-checks both at pull time (the manifest it
+                // pulls must match the summary's digest, every blob
+                // must match the manifest). What remains here is the
+                // bookkeeping the runtime plan needs.
+                match pinned {
+                    Some(digest) => Ok(oci::VerifyReport {
+                        digest,
+                        manifest_size: 0,
+                        flatpak_ref: Some(format!(
+                            "app/{}/{}/{}",
+                            app.app_id,
+                            orchard_core::host_ref_arch(),
+                            app.branch.as_deref().unwrap_or("stable"),
+                        )),
+                        metadata: app.metadata.clone(),
+                        installed_size: None,
+                        download_size: 0,
+                        config_digest: None,
+                    }),
+                    None => Err(anyhow::anyhow!(
+                        "registry artifact for {} has no pinned digest: the event must carry the sha256",
+                        app.app_id
+                    )),
+                }
+            } else if assets.is_none() && matches!(location, oci::Location::Https { .. }) {
                 let app_id = app.app_id.clone();
                 cx.background_executor()
                     .spawn(async move {
@@ -2643,6 +2684,7 @@ impl StoreRoot {
                                             &runtime_ref,
                                             &remote,
                                             scope,
+                                            false,
                                         ),
                                         landed_system
                                             .then(|| {
@@ -2675,8 +2717,13 @@ impl StoreRoot {
             // local OCI layout and hands flatpak that: the zero-setup
             // oci: path. Layouts are content-addressed by manifest
             // digest and land by rename, so an existing directory is
-            // a complete one and a retry skips the download.
-            let install_arg = match (&report, &download_source) {
+            // a complete one and a retry skips the download. The
+            // remote path skips all of it: flatpak pulls from the
+            // registered remote through indexd's proxy.
+            let install_arg = if remote_install {
+                String::new()
+            } else {
+                match (&report, &download_source) {
                 (Ok(report), source) if app.oci_assets.is_some()
                     || matches!(source, oci::Location::Registry { .. } | oci::Location::ManifestUrl(_)) => {
                     let dir = crate::cache::artifact_dir(&app.app_id, &report.digest);
@@ -2723,6 +2770,7 @@ impl StoreRoot {
                         cx.notify();
                     });
                     return;
+                }
                 }
             };
             let verified = report.map(|report| {
@@ -2779,14 +2827,32 @@ impl StoreRoot {
                         }
                         // a bundle artifact installs with --bundle and
                         // updates in place (no uninstall step: proven
-                        // bundle-over-bundle); an image artifact needs
-                        // the uninstall-then-install chain when updating
+                        // bundle-over-bundle); a remote-installed image
+                        // updates in place too (flatpak update sees the
+                        // persistent remote, the seam is retired); only
+                        // the direct-path oci: layout needs the
+                        // uninstall-then-install chain
                         let is_bundle =
                             app.oci_assets.is_none() && matches!(download_source, oci::Location::Https { .. });
+                        // the startup registration runs off-thread; an
+                        // install that beat it registers synchronously
+                        // (idempotent), so the remote path never races
+                        // its own remote
+                        if remote_install && !orchard_flatpak::oci_remote_registered() {
+                            let url = format!("oci+http://{}", crate::indexd_addr());
+                            let _ = orchard_flatpak::ensure_oci_remote(&url).status();
+                        }
                         let app_cmd = |no_deps: bool| {
                             if is_bundle {
                                 orchard_flatpak::install_bundle(
                                     &crate::cache::artifact_file(&app.app_id, &digest),
+                                )
+                            } else if remote_install {
+                                orchard_flatpak::install_ref(
+                                    flatpak_ref.as_deref().unwrap_or_default(),
+                                    orchard_flatpak::REMOTE_NAME,
+                                    orchard_flatpak::Scope::User,
+                                    no_deps,
                                 )
                             } else {
                                 orchard_flatpak::install_image(&install_arg, no_deps)
@@ -2817,8 +2883,21 @@ impl StoreRoot {
                         );
                         let install_label: &'static str =
                             if updating { "Update" } else { "Install" };
+                        // the remote path's in-place update: flatpak
+                        // update from the origin remote, no uninstall
+                        let app_step = |no_deps: bool| {
+                            if remote_install && updating {
+                                orchard_flatpak::update_ref(
+                                    orchard_flatpak::Scope::User,
+                                    &app.app_id,
+                                    app.branch.as_deref(),
+                                )
+                            } else {
+                                app_cmd(no_deps)
+                            }
+                        };
                         let install_step = |no_deps: bool| ChainedInstall {
-                            cmd: app_cmd(no_deps),
+                            cmd: app_step(no_deps),
                             verify: None,
                             then: None,
                             label: install_label,
@@ -2850,7 +2929,7 @@ impl StoreRoot {
                                     "Runtime install"
                                 };
                                 let no_deps = verify.is_some();
-                                if updating && !is_bundle {
+                                if updating && !is_bundle && !remote_install {
                                     let runtime_step = ChainedInstall {
                                         cmd: runtime_cmd,
                                         verify,
@@ -2882,6 +2961,18 @@ impl StoreRoot {
                                         cx,
                                     );
                                 }
+                            }
+                            _ if updating && remote_install => {
+                                // the seam retired for remote-installed
+                                // apps: flatpak update sees the remote
+                                // and the summary's digests
+                                this.run_job(
+                                    app_step(matches!(runtime_plan, RuntimePlan::NoDeps)),
+                                    &app.app_id,
+                                    install_label,
+                                    &place,
+                                    cx,
+                                );
                             }
                             _ if updating && !is_bundle => {
                                 this.run_job_chained(
