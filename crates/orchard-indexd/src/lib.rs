@@ -1029,7 +1029,16 @@ async fn v2_proxy(
                         return;
                     }
                 };
-                match agent.get(&url).set("Authorization", &format!("Bearer {token}")).call() {
+                match agent
+                    .get(&url)
+                    // the Accept types ride again: ghcr 404s a manifest
+                    // GET that names no manifest media type, and the
+                    // initial request's Accept does not survive into
+                    // this retry
+                    .set("Accept", orchard_core::oci::MANIFEST_ACCEPT)
+                    .set("Authorization", &format!("Bearer {token}"))
+                    .call()
+                {
                     Ok(response) => response,
                     Err(err) => {
                         eprintln!("v2 proxy: post-token fetch failed: {err:#}");
