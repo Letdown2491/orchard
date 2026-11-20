@@ -167,6 +167,52 @@ fn subscriptions(feed: &Feed, backfilled: bool) -> Vec<String> {
     ]
 }
 
+/// Per-relay health, stamped by the read loop and read by whoever
+/// fronts it (indexd's /v1/relays, the GUI's relays settings). The
+/// point (issue #12): a dead relay retries forever silently, and the
+/// UI shows confidently stale data. These fields are the difference
+/// between a silent failure and a visible one.
+#[derive(Clone, Debug, Default, serde::Serialize)]
+pub struct RelayHealth {
+    /// The loop believes the socket is open: set for the life of a
+    /// session, cleared while it waits out the backoff. A half-open
+    /// socket that fails its next ping flips this within READ_WAKE.
+    pub connected: bool,
+    /// Unix millis of the last text frame seen from the relay (EVENT
+    /// or EOSE, absorbed or not): liveness, not usefulness.
+    pub last_frame_at: Option<u64>,
+    /// What ended the last failed session, if one has failed.
+    pub last_error: Option<String>,
+    /// Consecutive short-or-failed sessions: the backoff counter.
+    pub failures: u32,
+}
+
+/// Health is one writer (the relay thread) and many readers (the HTTP
+/// endpoint, the GUI poll), so it travels shared and locked.
+pub type SharedRelayHealth = Arc<Mutex<RelayHealth>>;
+
+/// Every event relay's health, keyed by URL. The supervisor owns the
+/// map (rows appear and disappear with the relay set), each relay
+/// thread writes only its own row, the readers never block a writer
+/// for long: the endpoint and the GUI poll, nobody hot-loops it.
+pub type RelayHealthMap = Arc<Mutex<std::collections::BTreeMap<String, SharedRelayHealth>>>;
+
+fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Stamp the health record. Locks recover on poison, same rule as the
+/// feed: a poisoned health lock must not take the relay thread down.
+fn stamp(health: &SharedRelayHealth, f: impl FnOnce(&mut RelayHealth)) {
+    let mut health = health
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    f(&mut health);
+}
+
 /// How long one relay read may block before the loop wakes to check
 /// the stop flag. Long enough that it is invisible; short enough that
 /// a removed relay's thread is gone in under a minute.
@@ -174,12 +220,15 @@ const READ_WAKE: Duration = Duration::from_secs(30);
 
 /// Run one relay until the process exits or `stop` flips, reconnecting
 /// on errors. Calls `on_change` whenever the feed may have grown.
-/// Returns when asked to stop; the caller may then drop the thread.
+/// Stamps `health` with the connection state, last frame time, and
+/// failure count for whoever serves it. Returns when asked to stop;
+/// the caller may then drop the thread.
 pub fn run_forever(
     url: &str,
     feed: Arc<Mutex<Feed>>,
     on_change: Arc<dyn Fn() + Send + Sync>,
     stop: Arc<std::sync::atomic::AtomicBool>,
+    health: SharedRelayHealth,
 ) {
     // one clean look at the relay's stored history (a session that
     // saw its EOSE) is what makes the since-filter safe: until then
@@ -196,12 +245,21 @@ pub fn run_forever(
                 .unwrap_or_else(|poisoned| poisoned.into_inner()),
             backfilled,
         );
+        stamp(&health, |h| {
+            h.connected = true;
+        });
         // one panicked session must not take the thread down: a
         // background thread's panic is invisible in the UI, so it
         // costs a log line and the loop continues instead
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            session(url, &subs, &feed, &on_change, &stop)
+            session(url, &subs, &feed, &on_change, &stop, &health)
         }));
+        // the socket is (about to be) gone: the backoff wait is the
+        // honest "disconnected" window
+        stamp(&health, |h| {
+            h.connected = false;
+            h.failures = failures;
+        });
         match outcome {
             Ok(Ok(saw_eose)) => {
                 backfilled |= saw_eose;
@@ -211,6 +269,10 @@ pub fn run_forever(
                 // A clean close that came fast is a drop all the same.
                 if saw_eose || started.elapsed() >= HEALTHY_SESSION {
                     failures = 0;
+                    stamp(&health, |h| {
+                        h.failures = 0;
+                        h.last_error = None;
+                    });
                 } else {
                     failures += 1;
                 }
@@ -221,6 +283,10 @@ pub fn run_forever(
                     "relay {url}: {err:#}; retrying in {}s",
                     backoff_delay(failures).as_secs()
                 );
+                stamp(&health, |h| {
+                    h.failures = failures;
+                    h.last_error = Some(format!("{err:#}"));
+                });
             }
             Err(panic) => {
                 failures += 1;
@@ -229,8 +295,15 @@ pub fn run_forever(
                     "relay {url}: session panicked: {message}; retrying in {}s",
                     backoff_delay(failures).as_secs()
                 );
+                stamp(&health, |h| {
+                    h.failures = failures;
+                    h.last_error = Some(message);
+                });
             }
         }
+        stamp(&health, |h| {
+            h.failures = failures;
+        });
         std::thread::sleep(backoff_delay(failures));
     }
 }
@@ -250,6 +323,7 @@ fn session(
     feed: &Arc<Mutex<Feed>>,
     on_change: &Arc<dyn Fn() + Send + Sync>,
     stop: &Arc<std::sync::atomic::AtomicBool>,
+    health: &SharedRelayHealth,
 ) -> Result<bool> {
     let (mut socket, _response) = tungstenite::connect(url)?;
     crate::connect::set_read_timeout(&mut socket, READ_WAKE);
@@ -293,6 +367,9 @@ fn session(
         }
         match message {
             Message::Text(text) => {
+                // any text frame is a sign of life, absorbed or not:
+                // this is the liveness stamp /v1/relays serves
+                stamp(health, |h| h.last_frame_at = Some(now_millis()));
                 let (absorbed, eose) = handle_frame(text.as_str(), feed)?;
                 if let Some(id) = eose {
                     pending.remove(&id);

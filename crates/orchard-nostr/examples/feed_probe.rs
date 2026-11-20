@@ -39,7 +39,13 @@ fn main() {
     });
     std::thread::spawn(move || {
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        orchard_nostr::relay::run_forever(&url, Arc::clone(&feed), on_change, stop);
+        orchard_nostr::relay::run_forever(
+            &url,
+            Arc::clone(&feed),
+            on_change,
+            stop,
+            Default::default(),
+        );
     });
     std::thread::sleep(std::time::Duration::from_secs(8));
     std::process::exit(0);
