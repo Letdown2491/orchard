@@ -1,5 +1,46 @@
 # Changelog
 
+## v0.5.0 (2026-11-20)
+
+- **Native Linux packages (issue #1).** The release CI builds deb
+  (cargo-deb), rpm (cargo-generate-rpm), Alpine apk (abuild in an
+  alpine container), and Arch pkg artifacts for x86_64 and aarch64 on
+  every `v*` tag, and attaches them to the GitHub release beside the
+  oci-archive, each artifact wearing a minisign signature.
+- **The catalog serves as a real flatpak remote (issue #7).** indexd
+  answers `flatpak remote-add --oci`: a static `/index/static` (the
+  OCI index response flatpak synthesizes the ostree summary from) and
+  a `/v2` proxy that serves blobs by digest against the verified
+  catalog only. The client registers its own remote at startup and
+  installs publisher apps the classic way, so updates run through
+  `flatpak update` and the uninstall-then-install seam is retired for
+  these installs (it survives only for direct-path installs). Hosted
+  indexers take `--listen`/`--relays`/`--public-url`, with a systemd
+  unit in `packaging/systemd/`.
+- **The first copy is verifiable (issue #8).** Release artifacts wear
+  minisign signatures (`.minisig`) and the public key ships at
+  `packaging/minisign.pub`, so the bootstrap curl + install can be
+  checked through a second channel instead of download-and-pray. In
+  CI the signing key lives in `$RUNNER_TEMP` under `umask 077` with a
+  trap-verified removal.
+- **Publishing is a reusable workflow (issue #9).** The proven
+  self-publish path is extracted to
+  `.github/workflows/orchard-publish.yml`: an app repo consumes it
+  with `uses:`, passing its publish manifest and a build matrix;
+  PUBLISHING.md documents the caller shape.
+- **Relay health is visible (issue #12).** orchard-nostr tracks
+  per-relay health (connected, last frame, last error, failures) and
+  indexd serves computed frame ages at `GET /v1/relays`; the GUI polls
+  it on the 30s cadence: Settings' relay rows wear live / quiet Nm /
+  down, retrying badges, and the footer reads "relays unreachable"
+  when every tracked relay is disconnected.
+- **The /v2 proxy is hardened (self-audit).** Proxy fetches moved off
+  the current-thread runtime (oneshot head, mpsc body) onto a shared
+  pooled upstream client with a tight connect timeout and a 30-minute
+  overall cap, and the proxy answers only digest-pinned rows over
+  https (http allowed for loopback hosts), the same fetch gate the
+  client-side token path applies.
+
 ## v0.4.1 (2026-11-07)
 
 - **Per-stream reconnect anchors.** The structural catalog kinds

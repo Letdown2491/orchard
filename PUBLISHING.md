@@ -405,6 +405,24 @@ job that `needs:` this one, with the tree handed over as an artifact.
 The afternoon target: copy `templates/example-app/`, set two fields,
 push a tag.
 
+### Reusable workflow file gotchas
+
+If you fork or adapt the workflow file itself, three authoring rules,
+each learned from GitHub's push-time validation failing as an opaque
+0-second run with zero jobs and no annotation worth reading:
+
+- Input and secret `description` fields must be plain text. GitHub
+  evaluates `${{ }}` inside them at parse time, where the `github`
+  context does not exist (`Unrecognized named-value: 'github'`). Put
+  the expression guidance in the surrounding docs, not the field.
+- Secret inputs take no `default:` (only `description` and
+  `required`); an unset optional secret is simply empty.
+- The file declares a `push` trigger whose runs are no-ops (a job
+  guard skips every step, a matrix fallback keeps the strategy
+  expression evaluable): GitHub kept creating 0-second failed push
+  runs for the file even when `workflow_call` was its only trigger,
+  and giving the runs jobs to skip turns them neutral.
+
 ### The self-hosted shape
 
 `.github/workflows/self-publish.yml` is a working example (Orchard

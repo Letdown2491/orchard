@@ -16,7 +16,7 @@ version = "0.5.0"
 arch = "linux-x86_64"
 # Every declared platform must be present in the combined release.
 platforms = ["linux-x86_64", "linux-aarch64"]
-notes = "Reliability release: each catalog stream anchors its reconnect on its own kinds, so a chatty review can no longer blind the client to new releases; the Updated sort ranks on the newest arrived release's signed time, with same-day pushes listed newest first; the dev launcher warns at startup when a relay is unreachable."
+notes = "0.5.0 ships the store's own plumbing: the catalog serves as a real flatpak remote (updates run through flatpak itself, the uninstall-then-install seam retired), native deb/rpm/apk/Arch packages with a minisign-signed first copy, publishing extracted to a reusable workflow, and per-relay health badges in Settings."
 
 [artifact]
 tree = "tree"
