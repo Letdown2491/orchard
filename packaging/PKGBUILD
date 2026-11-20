@@ -1,0 +1,54 @@
+# The Arch package (orchard issue #1): the one leg satori-desktop never
+# built. Built through packaging/build-pkg.sh (makepkg refuses root),
+# never by hand.
+#
+# Trust model: no signing (makepkg builds the .pkg.tar.zst in CI; the
+# release page is the source). Install with pacman -U.
+#
+# The linked libs are named explicitly: pacman has no DT_NEEDED
+# auto-dependency like deb/rpm/apk. The dlopened set (strace,
+# 2026-11-20) is wayland and the vulkan loader; fontconfig and
+# freetype are vendored statically by gpui but their CONFIG and fonts
+# come from these packages, so they stay as deps.
+
+pkgname=orchard
+pkgver=0.5.0
+pkgrel=1
+pkgdesc="The permissionless Flatpak store: publishers sign, the catalog is a Nostr feed, every artifact is digest-pinned"
+url="https://github.com/Letdown2491/orchard"
+arch=('x86_64' 'aarch64')
+license=('MIT')
+depends=('fontconfig' 'freetype' 'libxkbcommon' 'libxkbcommon-x11' 'wayland'
+         'libxcb' 'vulkan-icd-loader')
+# Arch rolling carries a current rustc: edition 2024 needs 1.85, no
+# rustup dance required (unlike alpine 3.22's system cargo).
+makedepends=('rust' 'clang' 'pkgconf')
+source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
+# The checksum is the caller's truth: build-pkg.sh computes it from the
+# tarball it has (CI: the fetched tag tarball; local: a git archive).
+# 'SKIP' skips verification entirely.
+sha256sums=('SKIP')
+# GitHub's tag tarball extracts to orchard-<ver> (no v).
+builddir="$srcdir/$pkgname-$pkgver"
+
+build() {
+    cargo build --release --locked -p orchard
+}
+
+check() {
+    # The domain layer's suite: no display, no sockets, minutes-fast.
+    cargo test --locked -p orchard-core
+}
+
+package() {
+    install -Dm755 target/release/orchard \
+        "$pkgdir"/usr/bin/orchard
+    install -Dm644 packaging/rocks.orchard.Orchard.desktop \
+        "$pkgdir"/usr/share/applications/rocks.orchard.Orchard.desktop
+    install -Dm644 packaging/rocks.orchard.Orchard.metainfo.xml \
+        "$pkgdir"/usr/share/metainfo/rocks.orchard.Orchard.metainfo.xml
+    install -Dm644 assets/orchard-512.png \
+        "$pkgdir"/usr/share/icons/hicolor/512x512/apps/rocks.orchard.Orchard.png
+    install -Dm644 assets/orchard-128.png \
+        "$pkgdir"/usr/share/icons/hicolor/128x128/apps/rocks.orchard.Orchard.png
+}
