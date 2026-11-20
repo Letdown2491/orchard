@@ -197,13 +197,6 @@ pub type SharedRelayHealth = Arc<Mutex<RelayHealth>>;
 /// for long: the endpoint and the GUI poll, nobody hot-loops it.
 pub type RelayHealthMap = Arc<Mutex<std::collections::BTreeMap<String, SharedRelayHealth>>>;
 
-fn now_millis() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|since| since.as_millis() as u64)
-        .unwrap_or(0)
-}
-
 /// Stamp the health record. Locks recover on poison, same rule as the
 /// feed: a poisoned health lock must not take the relay thread down.
 fn stamp(health: &SharedRelayHealth, f: impl FnOnce(&mut RelayHealth)) {
@@ -245,12 +238,12 @@ pub fn run_forever(
                 .unwrap_or_else(|poisoned| poisoned.into_inner()),
             backfilled,
         );
-        stamp(&health, |h| {
-            h.connected = true;
-        });
         // one panicked session must not take the thread down: a
         // background thread's panic is invisible in the UI, so it
         // costs a log line and the loop continues instead
+        // ("connected" is stamped inside session(), once the socket
+        // is actually up: a relay stuck in a slow connect must not
+        // report live)
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             session(url, &subs, &feed, &on_change, &stop, &health)
         }));
@@ -327,6 +320,11 @@ fn session(
 ) -> Result<bool> {
     let (mut socket, _response) = tungstenite::connect(url)?;
     crate::connect::set_read_timeout(&mut socket, READ_WAKE);
+    // the socket is up: this is the honest "connected" stamp (a slow
+    // or failing dial keeps reporting disconnected)
+    stamp(health, |h| {
+        h.connected = true;
+    });
     for sub in subs {
         socket.send(Message::text(sub))?;
     }
@@ -369,7 +367,7 @@ fn session(
             Message::Text(text) => {
                 // any text frame is a sign of life, absorbed or not:
                 // this is the liveness stamp /v1/relays serves
-                stamp(health, |h| h.last_frame_at = Some(now_millis()));
+                stamp(health, |h| h.last_frame_at = Some(crate::unix_millis()));
                 let (absorbed, eose) = handle_frame(text.as_str(), feed)?;
                 if let Some(id) = eose {
                     pending.remove(&id);

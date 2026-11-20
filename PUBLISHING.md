@@ -411,6 +411,25 @@ push a tag.
 publishing itself). The shape to copy, replacing the manifest, assembly script
 and `com.example.App` with your application's paths and ID:
 
+It stays standalone on purpose (a `uses:` job cannot carry `run:` steps,
+so the assembly has to live in the caller). Three deliberate
+differences from the reusable workflow, so a "fix" does not flip the
+wrong one:
+
+- **Asset naming**: self-publish renames the archive to
+  `orchard-<arch>.oci.tgz`; the reusable workflow uploads the
+  publisher's own `<app-id>-<arch>.oci.tgz`. Bootstrap instructions
+  that hardcode one name do not fit the other path.
+- **Missing-key policy**: self-publish refuses to publish unsigned
+  (Orchard's own release wearing no signature is a regression); the
+  reusable workflow skips signing when the caller carries no
+  MINISIGN_SECRET_KEY, since for a caller the key is optional and the
+  Nostr events still pin the digests.
+- **Public key**: self-publish uploads the committed
+  `packaging/minisign.pub` next to the signature; a reusable-workflow
+  caller must publish their public key themselves (it lives in their
+  repo, which is fine: verifiers need it by some channel).
+
 ```yaml
 name: publish
 

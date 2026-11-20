@@ -110,10 +110,10 @@ jobs:
           ORCHARD_REGISTRY_USER: ${{ secrets.REGISTRY_USER || github.actor }}
           ORCHARD_REGISTRY_PASSWORD: ${{ secrets.REGISTRY_PASSWORD || github.token }}
         run: |
-          args=""
-          [ -n "${{ inputs.registry }}" ] && args="$args --registry ${{ inputs.registry }}"
+          args=()
+          [[ -n "${{ inputs.registry }}" ]] && args+=(--registry "${{ inputs.registry }}")
           orchard-publish "${{ inputs.manifest-path }}" \
-            --upload-only --arch "${{ matrix.arch }}" --out dist $args
+            --upload-only --arch "${{ matrix.arch }}" --out dist "${args[@]}"
 
       - uses: actions/upload-artifact@v4
         with:
@@ -132,7 +132,12 @@ jobs:
           # image fetch never authenticates, token registries always
           # challenge).
           asset="dist/asset-${{ matrix.arch }}"
-          tgz="$(ls dist/*.oci.tgz | head -1)"
+          # exactly one archive is expected; two would mean a stale
+          # dist and the release would carry the wrong one
+          shopt -s nullglob
+          tgzs=(dist/*.oci.tgz)
+          [[ ${#tgzs[@]} -eq 1 ]] || { echo "expected exactly one oci.tgz in dist/, found ${#tgzs[@]}" >&2; exit 1; }
+          tgz="${tgzs[0]}"
           gh release create "$GITHUB_REF_NAME" --generate-notes -R "$GITHUB_REPOSITORY" || true
           gh release upload "$GITHUB_REF_NAME" "$tgz" -R "$GITHUB_REPOSITORY" --clobber
 
@@ -148,10 +153,17 @@ jobs:
         run: |
           [ -n "$MINISIGN_SECRET_KEY" ] || { echo "no MINISIGN_SECRET_KEY: skipping"; exit 0; }
           sudo apt-get update && sudo apt-get install -y minisign
-          printf '%s\n' "$MINISIGN_SECRET_KEY" > /tmp/minisign.key
-          tgz="$(ls dist/*.oci.tgz | head -1)"
-          minisign -Sm "$tgz" -s /tmp/minisign.key -W
-          rm -f /tmp/minisign.key
+          # the key file is unencrypted (-W): owner-only permissions and
+          # a trap-verified removal, so a signing failure cannot leave
+          # it behind on the runner
+          umask 077
+          trap 'rm -f "$RUNNER_TEMP/minisign.key"' EXIT
+          printf '%s\n' "$MINISIGN_SECRET_KEY" > "$RUNNER_TEMP/minisign.key"
+          shopt -s nullglob
+          tgzs=(dist/*.oci.tgz)
+          [[ ${#tgzs[@]} -eq 1 ]] || { echo "expected exactly one oci.tgz in dist/, found ${#tgzs[@]}" >&2; exit 1; }
+          tgz="${tgzs[0]}"
+          minisign -Sm "$tgz" -s "$RUNNER_TEMP/minisign.key" -W
           gh release upload "$GITHUB_REF_NAME" "$tgz.minisig" -R "$GITHUB_REPOSITORY" --clobber
 
   publish:
@@ -186,7 +198,7 @@ jobs:
           # proof Orchard's client checks on install. --legacy-oci
           # names the registry manifest URL the client reads.
           assets=$(find dist -name '*.asset.json' | sort | sed 's/^/--asset /' | tr '\n' ' ')
-          relays=""
-          [ -n "${{ inputs.relays }}" ] && relays="--relays ${{ inputs.relays }}"
+          relays=()
+          [[ -n "${{ inputs.relays }}" ]] && relays+=(--relays "${{ inputs.relays }}")
           orchard-publish "${{ inputs.manifest-path }}" \
-            $assets --legacy-oci --prove $relays
+            $assets --legacy-oci --prove "${relays[@]}"

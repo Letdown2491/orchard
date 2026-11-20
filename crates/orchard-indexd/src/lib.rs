@@ -14,14 +14,11 @@
 //!   because indexd is the seam a remote catalog (Nostr, M3) plugs into
 //!   without touching client code.
 //! - `GET /index/<arch>` - an OCI image index enumerating the catalog's
-//!   artifacts. Kept from the first spike: this is *not* what flatpak's
-//!   `oci+` remotes read (validated in the M0 spike: those fetch an **ostree
-//!   summary** from the URL base, ref entries mapping to manifest digests,
-//!   with `xa.oci-registry-uri` pointing at the blob registry; see
-//!   `crates/orchard-flatpak/src/lib.rs`). The native-remote summary
-//!   endpoint lands in a later milestone; until then MVP installs go direct
-//!   via `flatpak install oci:/…` / `docker://…` with client-side digest
-//!   verification.
+//!   artifacts. Kept from the first spike, with no production consumer
+//!   left: flatpak's `oci+` remotes read `/index/static` and the `/v2`
+//!   proxy below (validated against flatpak 1.18.4), and the client's
+//!   direct path installs from its own OCI layouts. Kept for
+//!   inspection and debugging of the catalog's OCI view.
 //! - `GET /` - service description.
 
 use std::sync::{Arc, Mutex};
@@ -626,10 +623,7 @@ async fn graph(State(state): State<ServerState>) -> Json<orchard_core::GraphFile
 /// clock of its own and a poll every few seconds is the whole story.
 /// Rows appear and disappear with the supervisor's relay set.
 async fn relays(State(state): State<ServerState>) -> Json<serde_json::Value> {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|since| since.as_millis() as u64)
-        .unwrap_or(0);
+    let now = orchard_nostr::unix_millis();
     let rows: Vec<serde_json::Value> = match &state.relays_health {
         Some(map) => map
             .lock()
@@ -819,11 +813,12 @@ async fn index_static(
         results: images
             .into_iter()
             .map(|(name, mut images)| {
-                // the summary builder sorts by ref
+                // the summary builder sorts by ref (the ref lives in
+                // Labels; flatpak reads all per-image metadata there)
                 images.sort_by(|a, b| {
-                    a.annotations
+                    a.labels
                         .get(crate::ANNOTATION_FLATPAK_REF)
-                        .cmp(&b.annotations.get(crate::ANNOTATION_FLATPAK_REF))
+                        .cmp(&b.labels.get(crate::ANNOTATION_FLATPAK_REF))
                 });
                 FlatpakOciIndexRepository { name, images }
             })
@@ -857,16 +852,28 @@ async fn v2_proxy(
     let document = state.document.document();
     let mut upstream: Option<String> = None;
     'rows: for app in &document.apps {
+        // hardening: only a publisher digest-pinned row is proxied, and
+        // only from a URL this process may fetch (https, or http on
+        // loopback for the dev registry): a hosted indexd (0.0.0.0,
+        // third-party publishers) must not become an intranet pivot
+        // for a publisher-nominated URL
+        if app.digest.is_none() {
+            continue;
+        }
         if app.location.ends_with(&needle) {
-            upstream = Some(app.location.clone());
-            break;
+            if orchard_core::oci::fetchable_url(&app.location) {
+                upstream = Some(app.location.clone());
+            }
+            continue;
         }
         let Some(assets) = &app.oci_assets else {
             continue;
         };
         for asset in assets {
             if asset.url.ends_with(&needle) {
-                upstream = Some(asset.url.clone());
+                if orchard_core::oci::fetchable_url(&asset.url) {
+                    upstream = Some(asset.url.clone());
+                }
                 break 'rows;
             }
         }
@@ -874,57 +881,75 @@ async fn v2_proxy(
     let Some(url) = upstream else {
         return axum::http::StatusCode::NOT_FOUND.into_response();
     };
+    let repository = rest
+        .trim_start_matches("/v2/")
+        .split("/manifests/")
+        .next()
+        .unwrap_or(&rest)
+        .to_string();
 
     // The bearer dance: publisher registries (ghcr included) answer an
     // anonymous pull with 401 + WWW-Authenticate; flatpak would give
     // up here (the M5 lesson: it never even tries a token), indexd
-    // does the dance and relays the bytes.
-    let agent = ureq::AgentBuilder::new()
-        .timeout(std::time::Duration::from_secs(300))
-        .build();
-    let response = match if url.contains("/manifests/") {
-        // registries reject a manifest GET whose Accept names no
-        // manifest media type (distribution 3.x 404s it)
-        agent
-            .get(&url)
-            .set(
-                "Accept",
-                "application/vnd.oci.image.manifest.v1+json, \
-                 application/vnd.oci.image.index.v1+json, \
-                 application/vnd.docker.distribution.manifest.v2+json, \
-                 application/vnd.docker.distribution.manifest.list.v2+json",
-            )
-            .call()
-    } else {
-        agent.get(&url).call()
-    } {
-        Ok(response) => response,
-        Err(ureq::Error::Status(401, denied)) => {
-            let Some(challenge) = denied.header("www-authenticate") else {
-                return axum::http::StatusCode::BAD_GATEWAY.into_response();
-            };
-            let Some(token) = bearer_token(challenge, &needle) else {
-                return axum::http::StatusCode::BAD_GATEWAY.into_response();
-            };
-            match agent.get(&url).set("Authorization", &token).call() {
-                Ok(response) => response,
-                Err(_) => return axum::http::StatusCode::BAD_GATEWAY.into_response(),
-            }
-        }
-        Err(_) => return axum::http::StatusCode::BAD_GATEWAY.into_response(),
-    };
-    let content_type = response
-        .header("content-type")
-        .unwrap_or("application/octet-stream")
-        .to_string();
-
-    // Relay the body without blocking the runtime: the reader runs on
-    // a dedicated thread (blobs are hundreds of MB and the GUI runs
-    // this whole service on a current-thread tokio runtime), chunks
-    // cross to the response through a bounded channel.
+    // does the dance and relays the bytes. The WHOLE fetch runs on the
+    // relay thread, not just the body: the GUI runs this service on a
+    // current-thread tokio runtime, and a blocking connect or token
+    // round-trip here would stall the catalog and health endpoints for
+    // its duration. The response head crosses back through a oneshot,
+    // the body through a bounded channel.
+    let (head_tx, head_rx) = tokio::sync::oneshot::channel();
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(8);
     std::thread::spawn(move || {
+        let agent = upstream_agent();
+        let response = match if url.contains("/manifests/") {
+            // registries reject a manifest GET whose Accept names no
+            // manifest media type (distribution 3.x 404s it)
+            agent
+                .get(&url)
+                .set("Accept", orchard_core::oci::MANIFEST_ACCEPT)
+                .call()
+        } else {
+            agent.get(&url).call()
+        } {
+            Ok(response) => response,
+            Err(ureq::Error::Status(401, denied)) => {
+                let Some(challenge) = denied.header("www-authenticate") else {
+                    let _ = head_tx.send(Err(axum::http::StatusCode::BAD_GATEWAY));
+                    return;
+                };
+                let token = match orchard_core::oci::token_from_challenge(
+                    challenge,
+                    &repository,
+                    "orchard-indexd",
+                ) {
+                    Ok(token) => token,
+                    Err(err) => {
+                        eprintln!("v2 proxy: token fetch failed: {err:#}");
+                        let _ = head_tx.send(Err(axum::http::StatusCode::BAD_GATEWAY));
+                        return;
+                    }
+                };
+                match agent.get(&url).set("Authorization", &token).call() {
+                    Ok(response) => response,
+                    Err(_) => {
+                        let _ = head_tx.send(Err(axum::http::StatusCode::BAD_GATEWAY));
+                        return;
+                    }
+                }
+            }
+            Err(_) => {
+                let _ = head_tx.send(Err(axum::http::StatusCode::BAD_GATEWAY));
+                return;
+            }
+        };
+        let content_type = response
+            .header("content-type")
+            .unwrap_or("application/octet-stream")
+            .to_string();
         let mut reader = response.into_reader();
+        if head_tx.send(Ok(content_type)).is_err() {
+            return; // the requester is gone before the head landed
+        }
         let mut buf = vec![0u8; 64 * 1024];
         loop {
             match reader.read(&mut buf) {
@@ -934,7 +959,7 @@ async fn v2_proxy(
                         .blocking_send(Ok(bytes::Bytes::copy_from_slice(&buf[..n])))
                         .is_err()
                     {
-                        break;
+                        break; // the client disconnected mid-stream
                     }
                 }
                 Err(err) => {
@@ -944,6 +969,9 @@ async fn v2_proxy(
             }
         }
     });
+    let Ok(Ok(content_type)) = head_rx.await else {
+        return axum::http::StatusCode::BAD_GATEWAY.into_response();
+    };
     (
         [(axum::http::header::CONTENT_TYPE, content_type)],
         axum::body::Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx)),
@@ -951,52 +979,22 @@ async fn v2_proxy(
         .into_response()
 }
 
-/// Parse a WWW-Authenticate Bearer challenge and fetch the pull token
-/// for one repository. Only what the registries in front of Orchard
-/// send today: realm, service, scope.
-fn bearer_token(challenge: &str, path: &str) -> Option<String> {
-    let rest = challenge.strip_prefix("Bearer ")?;
-    let mut realm = None;
-    let mut service = None;
-    let mut scope = None;
-    for part in rest.split(',') {
-        let part = part.trim();
-        if let Some(value) = part.strip_prefix("realm=") {
-            realm = Some(value.trim_matches('"').to_string());
-        } else if let Some(value) = part.strip_prefix("service=") {
-            service = Some(value.trim_matches('"').to_string());
-        } else if let Some(value) = part.strip_prefix("scope=") {
-            scope = Some(value.trim_matches('"').to_string());
-        }
-    }
-    let realm = realm?;
-    // the challenge's scope names the repository it denied; reuse it
-    // when present, else ask for the path we wanted
-    let scope = scope.unwrap_or_else(|| format!("repository:{}:pull", path.trim_start_matches("/v2/").split("/manifests/").next().unwrap_or("")));
-    let mut url = format!("{realm}?scope={}", uri_escape(&scope));
-    if let Some(service) = service {
-        url.push_str(&format!("&service={}", uri_escape(&service)));
-    }
-    let agent = ureq::AgentBuilder::new()
-        .timeout(std::time::Duration::from_secs(30))
-        .build();
-    let response = agent.get(&url).call().ok()?;
-    let json: serde_json::Value = response.into_json().ok()?;
-    json["token"].as_str().map(|t| t.to_string())
-}
-
-/// Percent-encode the few characters a query value may not carry.
-fn uri_escape(value: &str) -> String {
-    let mut out = String::with_capacity(value.len());
-    for byte in value.bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b':' | b'/' => {
-                out.push(byte as char)
-            }
-            _ => out.push_str(&format!("%{byte:02X}")),
-        }
-    }
-    out
+/// One shared agent for every upstream registry fetch (the proxy and
+/// the token dance): pooled connections survive across flatpak's
+/// manifest and blob requests instead of a fresh TLS handshake per
+/// request. The connect timeout is tight; the overall timeout is
+/// generous because a blob is hundreds of MB and a slow link is not an
+/// error (the reader thread exits on client disconnect regardless).
+fn upstream_agent() -> ureq::Agent {
+    static AGENT: std::sync::OnceLock<ureq::Agent> = std::sync::OnceLock::new();
+    AGENT
+        .get_or_init(|| {
+            ureq::AgentBuilder::new()
+                .timeout_connect(std::time::Duration::from_secs(10))
+                .timeout(std::time::Duration::from_secs(30 * 60))
+                .build()
+        })
+        .clone()
 }
 
 /// Clear absorbed events: the feed refills from the relays on their
@@ -1020,7 +1018,8 @@ async fn clear_cache(State(state): State<ServerState>) -> &'static str {
 /// second, no restart.
 pub async fn serve(
     addr: std::net::SocketAddr,
-    state: ServerState,
+    base: Arc<dyn CatalogDocument>,
+    public_url: Option<String>,
     settings: orchard_core::SettingsHandle,
     cache: Option<std::path::PathBuf>,
 ) -> anyhow::Result<()> {
@@ -1038,7 +1037,7 @@ pub async fn serve(
     spawn_profile_crawler(settings, Arc::clone(&feed));
     let state = ServerState {
         document: Arc::new(NostrCatalog {
-            base: state.document.document(),
+            base: base.document(),
             feed,
             graph,
         }),
@@ -1047,11 +1046,7 @@ pub async fn serve(
         // the Registry name /index/static advertises: the operator's
         // public base when set (a reverse proxy in front), else this
         // process's own bind address
-        public_url: Some(
-            state
-                .public_url
-                .unwrap_or_else(|| format!("http://{addr}")),
-        ),
+        public_url: Some(public_url.unwrap_or_else(|| format!("http://{addr}"))),
     };
     // A restart races the previous instance's dying listener for the
     // port, and losing that race used to cost the whole session: the

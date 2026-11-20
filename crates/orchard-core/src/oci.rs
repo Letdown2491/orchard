@@ -668,7 +668,7 @@ fn read_body(reader: impl std::io::Read, url: &str) -> Result<Vec<u8>> {
 /// token endpoint takes query params and answers JSON with `token` or
 /// `access_token`; values are percent-encoded so hosts and repo names
 /// with unusual characters survive.
-fn token_from_challenge(challenge: &str, repository: &str, client_id: &str) -> Result<String> {
+pub fn token_from_challenge(challenge: &str, repository: &str, client_id: &str) -> Result<String> {
     let (realm, token_url) = token_endpoint(challenge, repository, client_id)?;
     let agent = ureq::AgentBuilder::new()
         .timeout(std::time::Duration::from_secs(30))
@@ -691,9 +691,36 @@ fn token_from_challenge(challenge: &str, repository: &str, client_id: &str) -> R
     Ok(token.to_string())
 }
 
+/// Whether this process may be made to fetch `url` on another party's
+/// behalf: https always, plain http only on loopback (the dev
+/// registry). This is the gate for every URL a third party nominates
+/// (a catalog location, a token realm): a hosted indexd that listens
+/// on 0.0.0.0 must not become an intranet pivot, and metadata
+/// services answer plain http on link-local addresses, which the
+/// http-only-on-loopback rule refuses. Nothing here can help an
+/// https-only internal address, so those stay allowed.
+pub fn fetchable_url(url: &str) -> bool {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return false;
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    // strip userinfo, then the port; unwrap an IPv6 bracketed host
+    let authority = authority.rsplit_once('@').map(|(_, a)| a).unwrap_or(authority);
+    let host = match authority.strip_prefix('[') {
+        Some(rest) => rest.split(']').next().unwrap_or(rest),
+        None => authority.split(':').next().unwrap_or(authority),
+    };
+    let loopback = host == "localhost" || host == "::1" || host.starts_with("127.");
+    match scheme {
+        "http" => loopback,
+        "https" => true,
+        _ => false,
+    }
+}
+
 /// The pure half of [`token_from_challenge`]: the realm and the fully
 /// formed token URL for a challenge.
-fn token_endpoint(challenge: &str, repository: &str, client_id: &str) -> Result<(String, String)> {
+pub fn token_endpoint(challenge: &str, repository: &str, client_id: &str) -> Result<(String, String)> {
     let mut realm = None;
     let mut service = None;
     let mut scope = Some(format!("repository:{repository}:pull"));
@@ -721,6 +748,12 @@ fn token_endpoint(challenge: &str, repository: &str, client_id: &str) -> Result<
         }
     }
     let realm = realm.ok_or_else(|| anyhow!("WWW-Authenticate without realm: {challenge:?}"))?;
+    // the realm is a URL a challenge (ultimately a third party)
+    // nominated: apply the same fetch gate as every other
+    // publisher-chosen URL before the process dials it
+    if !fetchable_url(&realm) {
+        bail!("token realm {realm} is not an endpoint this process may fetch");
+    }
     let query: &[(&str, &str)] = &[
         ("service", service.as_deref().unwrap_or("")),
         ("scope", scope.as_deref().unwrap_or("")),
@@ -980,6 +1013,22 @@ mod tests {
             .to_string();
         assert!(err.contains("already a local layout"), "{err}");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn fetch_gate_rules() {
+        // https anywhere
+        assert!(fetchable_url("https://ghcr.io/v2/name/manifests/sha256:00"));
+        // plain http only on loopback: the dev registry, not an
+        // intranet pivot or a link-local metadata service
+        assert!(fetchable_url("http://127.0.0.1:5000/v2/name/manifests/sha256:00"));
+        assert!(fetchable_url("http://localhost:9999/v2/name"));
+        assert!(!fetchable_url("http://169.254.169.254/latest/meta-data"));
+        assert!(!fetchable_url("http://10.0.0.4/v2/name/manifests/sha256:00"));
+        assert!(!fetchable_url("http://registry.internal/v2/name"));
+        // no scheme, no fetch
+        assert!(!fetchable_url("file:///etc/passwd"));
+        assert!(!fetchable_url("ghcr.io/v2/name"));
     }
 
     #[test]

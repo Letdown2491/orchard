@@ -113,9 +113,13 @@ jobs:
             exit 1
           fi
           sudo apt-get update && sudo apt-get install -y minisign
-          printf '%s\n' "$MINISIGN_SECRET_KEY" > /tmp/minisign.key
-          minisign -Sm "orchard-${{ matrix.arch }}.oci.tgz" -s /tmp/minisign.key -W
-          rm -f /tmp/minisign.key
+          # the key file is unencrypted (-W): owner-only permissions and
+          # a trap-verified removal, so a signing failure cannot leave
+          # it behind on the runner
+          umask 077
+          trap 'rm -f "$RUNNER_TEMP/minisign.key"' EXIT
+          printf '%s\n' "$MINISIGN_SECRET_KEY" > "$RUNNER_TEMP/minisign.key"
+          minisign -Sm "orchard-${{ matrix.arch }}.oci.tgz" -s "$RUNNER_TEMP/minisign.key" -W
           gh release upload "$GITHUB_REF_NAME" \
             "orchard-${{ matrix.arch }}.oci.tgz.minisig" \
             packaging/minisign.pub --clobber
