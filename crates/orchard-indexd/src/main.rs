@@ -18,7 +18,7 @@ use orchard_core::CatalogFile;
 
 fn load_catalog(path_arg: Option<String>) -> anyhow::Result<CatalogFile> {
     let mut candidates: Vec<std::path::PathBuf> = Vec::new();
-    if let Some(arg) = path_arg {
+    if let Some(arg) = path_arg.as_deref() {
         candidates.push(arg.into());
     }
     candidates.push("demo/catalog.json".into());
@@ -44,7 +44,15 @@ fn load_catalog(path_arg: Option<String>) -> anyhow::Result<CatalogFile> {
             Err(err) => return Err(err).with_context(|| path.display().to_string()),
         }
     }
-    anyhow::bail!("no catalog found (tried {:?})", candidates)
+    if let Some(arg) = path_arg.as_deref() {
+        anyhow::bail!("catalog not found: {arg}")
+    }
+    // A hosted daemon starts legitimately empty: the catalog is not the
+    // source of truth, the relays are, and verified events merge over
+    // this base and persist beside it. Only an explicitly named missing
+    // file is an error.
+    eprintln!("no catalog file; starting empty (relays merge over this base)");
+    Ok(CatalogFile { version: 1, apps: Vec::new() })
 }
 
 /// The settings: the same file the client uses, so the standalone
