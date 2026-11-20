@@ -50,16 +50,27 @@ pub fn flatpak_command() -> Command {
 
 /// Register the local index shim (`orchard-indexd`) as an OCI remote.
 ///
-/// `index_url` looks like `oci+http://127.0.0.1:7780`. Note (validated in the
-/// M0 spike, flatpak sources `common/flatpak-dir.c`): an `oci+http(s)` remote
-/// fetches an **ostree summary** from the URL base, whose ref entries map to
-/// image manifest digests, with `xa.oci-registry-uri` in the summary
-/// metadata naming the registry that serves blobs. Serving that summary is
-/// the future native-remote flow; until then the shim's HTTP catalog API is
-/// what the client uses.
+/// `index_url` looks like `oci+http://127.0.0.1:7780`. The remote is
+/// real: flatpak fetches `{base}/index/static` (an OCI index response)
+/// and synthesizes the ostree summary client-side, whose ref entries map
+/// to image manifest digests, with `xa.oci-registry-uri` in the summary
+/// metadata naming the registry that serves blobs. Validated against
+/// flatpak 1.18.4 (`common/flatpak-oci-registry.c`): per-image metadata
+/// comes from the index's Labels member (the ref key is
+/// `org.flatpak.ref`), and a manifest GET without an Accept header
+/// naming manifest media types is 404ed by some registries, which is
+/// why indexd's proxy sends one. `--if-not-exists` keeps this
+/// idempotent: the client runs it at every startup.
 pub fn ensure_oci_remote(index_url: &str) -> Command {
     let mut cmd = flatpak_command();
-    cmd.args(["remote-add", "--oci", "--user", REMOTE_NAME, index_url]);
+    cmd.args([
+        "remote-add",
+        "--if-not-exists",
+        "--oci",
+        "--user",
+        REMOTE_NAME,
+        index_url,
+    ]);
     cmd
 }
 
@@ -523,6 +534,7 @@ mod tests {
         let cmd = ensure_oci_remote("oci+http://127.0.0.1:7780");
         let args = arg_strings(&cmd);
         assert!(args.contains(&"--oci".to_string()));
+        assert!(args.contains(&"--if-not-exists".to_string()));
         assert!(args.contains(&"oci+http://127.0.0.1:7780".to_string()));
         assert!(args.contains(&REMOTE_NAME.to_string()));
     }

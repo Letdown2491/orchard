@@ -43,6 +43,7 @@ fn start_indexd(catalog: orchard_core::CatalogFile, settings: orchard_core::Sett
                 document: std::sync::Arc::new(catalog),
                 relays_reset: None,
                 relays_health: None,
+                public_url: None,
             };
             let cache = crate::cache::events_cache_path();
             // the settings handle stays live: relay edits in the
@@ -62,6 +63,33 @@ fn start_indexd(catalog: orchard_core::CatalogFile, settings: orchard_core::Sett
         }
         std::thread::sleep(std::time::Duration::from_millis(25));
     }
+
+    // Issue #7, the bulk seam: register the shim as a real flatpak
+    // remote (`flatpak remote-add --if-not-exists --oci --user orchard
+    // oci+http://...`). Idempotent, best-effort, off the startup path:
+    // a failure leaves the client working as before (installs through
+    // its own plumbing) while `flatpak install orchard/...` and GNOME
+    // Software just do not see the remote. Runs after the bind so the
+    // summary fetch the registration triggers has something to read.
+    std::thread::Builder::new()
+        .name("flatpak-remote".into())
+        .spawn(move || {
+            let url = format!("oci+http://{addr}");
+            match orchard_flatpak::ensure_oci_remote(&url).output() {
+                Ok(output) if output.status.success() => {
+                    println!("flatpak remote registered: {url}");
+                }
+                Ok(output) => {
+                    eprintln!(
+                        "flatpak remote registration failed ({}): {}",
+                        output.status,
+                        String::from_utf8_lossy(&output.stderr).trim()
+                    );
+                }
+                Err(err) => eprintln!("flatpak remote registration failed: {err}"),
+            }
+        })
+        .expect("failed to spawn flatpak-remote thread");
 }
 
 /// Catalog file candidates, mirroring indexd's standalone runner.

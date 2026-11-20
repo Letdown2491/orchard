@@ -14,7 +14,10 @@ orchard-core = { workspace = true }
 orchard-nostr = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 tokio = { workspace = true }
+tokio-stream = "0.1"
+bytes = "1"
 ureq = { workspace = true }
 
 [[bin]]

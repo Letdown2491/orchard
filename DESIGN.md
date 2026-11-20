@@ -14,13 +14,15 @@ client, not a gatekeeper.**
 |---|---|
 | Artifacts | OCI images on developer-owned registries (ghcr, quay, self-hosted); `.flatpak` bundles as fallback |
 | Metadata protocol | Nostr events (Zapstore-style, NIP-82 draft); Orchard is a client/indexer, never the source of truth |
-| Product surface | Desktop client only (no server-side store) |
+| Product surface | Desktop client only (no server-side store), plus the headless indexer as a second artifact: `orchard-indexd` runs in the GUI's process, on a laptop, or on any operator's VPS. Compatible with "no central server" because it is optional, plural, and cannot forge signatures, only relay or withhold them |
 | Flathub | Ingested client-side as a read-only "reviewed" channel, locked on: reviewed installs resolve their runtimes and dependencies from it, so the source cannot be hidden (load re-clamps a pre-lock off) |
-| Binaries | Developer-owned registries only; Orchard never stores or proxies bytes |
+| Binaries | Developer-owned registries only; Orchard never stores bytes. The indexd proxy is a relay, not a store: it forwards a digest-pinned URL tail from the verified catalog and keeps nothing |
 | Media | Publisher-hosted URLs; no Orchard-run media service |
 | Sandbox permissions | Never published in events: flatpak bakes `finish-args` into the artifact, the client reads the real sandbox from it; no declared-vs-actual gap |
-| Artifact fetch | The client owns it: verify the manifest by digest, download a local OCI layout, hand flatpak `oci:<dir>` (flatpak's own `docker://` fetch never authenticates; ghcr always challenges) |
-| Install scope | User scope for Orchard apps (flatpak's system-scope image install is broken upstream); Flathub installs stay system scope |
+| Artifact fetch | Two paths, one trust story. Direct (the client's own): verify the manifest by digest, download a local OCI layout, hand flatpak `oci:<dir>` (flatpak's own `docker://` fetch never authenticates; ghcr always challenges). Remote (issue #7, the bulk seam): the catalog is a real flatpak remote (`flatpak remote-add --oci orchard oci+http://127.0.0.1:7780`), indexd serves `/index/static` (the OCI index flatpak synthesizes the ostree summary from) and proxies `/v2` by digest; flatpak checks every digest against the publisher's pin, so the relay cannot lie |
+| Flatpak remote rules | Runtimes come from Flathub ("orchard serves apps, flathub serves runtimes"; operators may mirror runtimes, the default needs Flathub enabled). Bundles stay client-only: the summary covers OCI-image artifacts, Zapstore-shaped `.flatpak` bundles never appear through a remote, so other-store visibility is the publisher's pressure toward OCI. Uninstall leaves a corpse, honestly: the interesting uninstall removes the remover, flatpak has no post-uninstall hook, so the dead `orchard` remote stays; documented fix `flatpak remote-delete orchard`, and a dead loopback remote fails fast rather than hanging |
+| Read-only over flatpak state | Amended (issue #7): v1's "no `remote-add`" becomes "adds exactly one remote, its own." The client registers `orchard` (`--if-not-exists`, best-effort, off the startup path) when its in-process indexd binds; nothing else about flatpak state is touched |
+| Install scope | User scope for Orchard apps (flatpak's system-scope image install is broken upstream); Flathub installs stay system scope. Carried scope mismatch: GNOME Software may show remote apps as available-but-not-installed until it queries the user installation too |
 | Runtime pre-flight | A publisher install deploys the artifact's own `runtime=` first: already user-deployed, plain install; system-deployed, `--no-deps` (flatpak's `oci:` path never resolves runtimes from remotes, but run time resolves them across installations); deployed nowhere, the runtime installs from the serving remote, user scope first, system scope under polkit |
 | Rendezvous relays | A small, public, versioned relay set; every publisher's manifest must include the Orchard-run relay (`wss://relay.orchard.rocks`), enforced by orchard-publish |
 | Identity for publishing | NIP-46 remote signer; the client never sees a secret key, the signer's pubkey is the identity |
@@ -28,7 +30,7 @@ client, not a gatekeeper.**
 | Confirmations | One confirm modal for every consequential action (install, update, remove, job cancel, settings clears); no two-press arming, nothing configurable |
 | Update checks | The launch check is unconditional (every session, whatever the setting says); the cadence only picks the repeats: Off, Hourly, Daily (default) |
 | Update affordance | No "Update available" badge: the Update button wears the amber itself, on rows and the app page; a publisher-key change is a banner on the page and a line in the confirm modal |
-| Update seam | Image updates are uninstall-then-install: flatpak 1.18.4 refuses `flatpak install` over an installed ref at any version (`--or-update` included) and the `oci:` flow's origin remote is transient, so `flatpak update` is blind. The running instance survives the uninstall (deleted deploys stay mapped) and user data is kept. Bundle artifacts (`.flatpak` over https) install with `--bundle` and update in place, no chain |
+| Update seam | Image updates are uninstall-then-install: flatpak 1.18.4 refuses `flatpak install` over an installed ref at any version (`--or-update` included) and the `oci:` flow's origin remote is transient, so `flatpak update` is blind. The running instance survives the uninstall (deleted deploys stay mapped) and user data is kept. Bundle artifacts (`.flatpak` over https) install with `--bundle` and update in place, no chain. Remote-installed apps (issue #7) retire the seam: `flatpak update` sees the registered remote and the summary carries the digests; the seam remains only for direct-path installs |
 | Screenshots | The listing carries them as `screenshot` tag rows: absolute URLs, best first, the store renders the first six from the same disk cache the icons use. No media service and no blobs: the publisher hosts the bytes like the icon |
 | Language / UI | Rust end-to-end; GPUI `0.2` from crates.io |
 | Build | Podman container on the atomic host (see "Build environment") |
@@ -238,7 +240,30 @@ the installation that hosts it. A remote whose AppStream never synced (just adde
 never searched) is refreshed client-side with flatpak's own catalog fetch and merged
 late; a dead remote times out and stays absent. The same app id on two remotes renders
 once, the built-in remote's row winning; per-channel twins are a follow-up. Orchard
-itself stays read-only over flatpak state: no `remote-add`, no key handling.
+itself stays read-only over flatpak state, with the one issue #7 exception (above): it
+adds exactly one remote, its own, and no other `remote-add`, no key handling.
+
+### The flatpak remote surface (issue #7)
+
+The catalog is a real flatpak remote. `oci+` remotes fetch `{base}/index/static` (an
+OCI index response) and synthesize the ostree summary client-side; per-image metadata
+comes from the response's `Labels` member (`org.flatpak.ref` names the ref,
+`org.flatpak.metadata` carries the flatpak metadata ini; ground truth: flatpak 1.18.4
+`common/flatpak-oci-registry.c`, `get_image_metadata` reads Labels, not Annotations).
+`xa.oci-registry-uri` in the summary names indexd itself, and indexd proxies `/v2`
+against the URLs the verified catalog already carries (manifest GETs send the Accept
+header some registries 404 without; 401s do the anonymous bearer dance flatpak never
+attempts). The proxy is a relay, not a store: digest-addressed URL tails, nothing
+cached, flatpak verifies every digest against the publisher's pin. One artifact, two
+configurations: loopback for the local client (registered automatically, `--if-not-exists`,
+best-effort), hosted behind a reverse proxy for anyone (`--listen`, `--relays`,
+`--public-url`; the systemd unit in `packaging/systemd/`). Spike answers: flatpak OCI
+remotes carry no AppStream branch, so GNOME Software/Discover show the metadata the
+summary's flatpak metadata ini provides, thin by web-store standards; `.flatpakrepo`
+one-click for `oci+` URLs is parked, the copy-paste command is the documented path.
+Trust posture: an indexer is a Nostr relay with a flatpak face; convenience, not
+verification. No operator-side verification service, ever: it converts "publisher
+signed" into "operator attests", a model change dressed as a feature.
 
 ## Client
 

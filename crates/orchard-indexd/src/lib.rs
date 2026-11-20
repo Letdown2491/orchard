@@ -26,7 +26,8 @@
 
 use std::sync::{Arc, Mutex};
 
-use axum::extract::{Path as AxumPath, State};
+use axum::extract::{Path as AxumPath, Query as AxumQuery, State};
+use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 
@@ -203,6 +204,13 @@ pub struct ServerState {
     /// /v1/relays (issue #12: silent relay failures become visible
     /// ones). None for a static document.
     pub relays_health: Option<orchard_nostr::relay::RelayHealthMap>,
+    /// The externally-visible base URL of this service: what the
+    /// /index/static response names as its Registry, so flatpak's
+    /// manifest and blob fetches come back here (the proxy). Defaults
+    /// to the bind address; a hosted deployment sets the public URL
+    /// (--public-url / ORCHARD_PUBLIC_URL) when TLS terminates at a
+    /// reverse proxy.
+    pub public_url: Option<String>,
 }
 
 /// Relay and cache configuration for [`serve`].
@@ -541,7 +549,7 @@ fn spawn_relay_supervisor(
     health
 }
 
-/// Build the axum router for a state.
+/// Build the router for a state.
 pub fn router(state: ServerState) -> Router {
     Router::new()
         .route("/", get(root))
@@ -551,6 +559,9 @@ pub fn router(state: ServerState) -> Router {
         .route("/v1/profiles", get(profiles))
         .route("/v1/graph", get(graph))
         .route("/v1/relays", get(relays))
+        .route("/index/static", get(index_static))
+        .route("/v2/", get(v2_ping))
+        .route("/v2/{*rest}", get(v2_proxy))
         .route("/v1/cache", post(clear_cache))
         .with_state(state)
 }
@@ -559,7 +570,7 @@ async fn root() -> Json<serde_json::Value> {
     Json(serde_json::json!({
         "service": "orchard-indexd",
         "description": "Orchard's local catalog service",
-        "endpoints": ["/v1/catalog", "/v1/reviews", "/v1/profiles", "/v1/graph", "/v1/relays", "/index/{arch}"]
+        "endpoints": ["/v1/catalog", "/v1/reviews", "/v1/profiles", "/v1/graph", "/v1/relays", "/index/static", "/index/{arch}", "/v2/"]
     }))
 }
 
@@ -645,6 +656,349 @@ async fn relays(State(state): State<ServerState>) -> Json<serde_json::Value> {
     Json(serde_json::json!({ "relays": rows }))
 }
 
+// ---------------------------------------------------------------------------
+// The flatpak remote surface (issue #7): `oci+http(s)` remotes fetch an
+// OCI index at `{base}/index/static` and synthesize the ostree summary
+// client-side, then fetch manifests and blobs over the OCI distribution
+// API at the index's Registry URI. Ground truth: flatpak 1.18.4
+// `common/flatpak-oci-registry.c` (flatpak_oci_index_make_summary,
+// flatpak_oci_index_ensure_cached) and `common/flatpak-json-oci.c` (the
+// JSON member names are the literal CamelCase below).
+//
+// indexd is the blob path: flatpak's OCI fetch never authenticates (the
+// M5 lesson: not even a token attempt on a 401), and publisher
+// registries like ghcr require the anonymous bearer dance. So Registry
+// points at indexd itself, and indexd proxies /v2/ by digest against
+// the URLs the verified catalog already carries. A proxy cannot lie:
+// flatpak checks the manifest digest against the summary ref entry and
+// every blob against the manifest's own digests.
+// ---------------------------------------------------------------------------
+
+/// The `{base}/index/static` response. Member names are flatpak's
+/// (ground truth: `flatpak-json-oci.c` demarshals these literals), not
+/// the OCI spec's.
+#[derive(Debug, serde::Serialize)]
+pub struct FlatpakOciIndexResponse {
+    /// The registry that serves manifests and blobs: resolved relative
+    /// to the index URI, so an absolute URL wins (the operator's
+    /// public base; indexd's own proxy endpoints live there).
+    #[serde(rename = "Registry")]
+    registry: String,
+    #[serde(rename = "Results")]
+    results: Vec<FlatpakOciIndexRepository>,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct FlatpakOciIndexRepository {
+    #[serde(rename = "Name")]
+    name: String,
+    #[serde(rename = "Images")]
+    images: Vec<FlatpakOciIndexImage>,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct FlatpakOciIndexImage {
+    #[serde(rename = "Digest")]
+    digest: String,
+    #[serde(rename = "MediaType")]
+    mediatype: String,
+    #[serde(rename = "OS")]
+    os: String,
+    #[serde(rename = "Architecture")]
+    architecture: String,
+    #[serde(rename = "Annotations")]
+    annotations: std::collections::BTreeMap<String, String>,
+    #[serde(rename = "Labels", skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    labels: std::collections::BTreeMap<String, String>,
+    #[serde(rename = "Tags")]
+    tags: Vec<String>,
+}
+
+/// flatpak's `flatpak_arch_to_oci_arch`, backwards: the catalog's
+/// platform tags use flatpak arches, the index/static query filters by
+/// OCI arch.
+fn oci_arch_to_flatpak_arch(oci: &str) -> Option<&'static str> {
+    match oci {
+        "amd64" => Some("x86_64"),
+        "arm64" => Some("aarch64"),
+        "x86_64" => Some("x86_64"),
+        "aarch64" => Some("aarch64"),
+        _ => None,
+    }
+}
+
+/// The registry host and repository path of an artifact `location`
+/// (`http(s)://host/v2/<name>/manifests/<digest>`). None for the other
+/// location shapes (http manifest URLs, local layouts), which have no
+/// registry to route through.
+fn parse_registry_location(location: &str) -> Option<(String, String)> {
+    let rest = location
+        .strip_prefix("http://")
+        .or_else(|| location.strip_prefix("https://"))?;
+    // authority up to the first slash
+    let (host, path) = rest.split_once('/')?;
+    let name = path.strip_prefix("v2/")?.split("/manifests/").next()?.to_string();
+    if name.is_empty() {
+        return None;
+    }
+    Some((host.to_string(), name))
+}
+
+/// GET /index/static: the live catalog as flatpak's OCI index, one
+/// image per (app, platform). Regenerated per request, so relay events
+/// appear without a restart; the ETag is the body's own digest.
+async fn index_static(
+    State(state): State<ServerState>,
+    AxumQuery(query): AxumQuery<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    let want_arch = query
+        .get("architecture")
+        .and_then(|a| oci_arch_to_flatpak_arch(a).map(|s| s.to_string()));
+    let document = state.document.document();
+
+    // Group one image per (repository, platform). Rows whose location
+    // is not a registry reference have no flatpak-remote story (the
+    // client installs them directly); they simply do not appear here.
+    let mut images: std::collections::BTreeMap<String, Vec<FlatpakOciIndexImage>> =
+        Default::default();
+    for app in &document.apps {
+        let digest = match &app.digest {
+            Some(digest) => digest.clone(),
+            None => continue,
+        };
+        let Some((_host, repository)) = parse_registry_location(&app.location) else {
+            continue;
+        };
+        for platform in &app.platforms {
+            // platform tags are `linux-<arch>`; the index/static query
+            // asks for a specific OCI arch when flatpak sends one
+            let Some(arch) = platform.strip_prefix("linux-") else {
+                continue;
+            };
+            if let Some(want) = &want_arch
+                && arch != want
+            {
+                continue;
+            }
+            // flatpak reads all per-image metadata from Labels, not
+            // Annotations (ground truth: get_image_metadata only
+            // consults img->labels): the ref makes the row installable,
+            // the metadata ini is the flatpak metadata it deploys, and
+            // a row whose labels lack the metadata key is skipped as
+            // "not a flatpak" by the summary builder
+            let mut labels = std::collections::BTreeMap::new();
+            labels.insert(
+                crate::ANNOTATION_FLATPAK_REF.to_string(),
+                app.flatpak_ref.clone(),
+            );
+            labels.insert(
+                "org.flatpak.metadata".to_string(),
+                app.metadata.clone().unwrap_or_default(),
+            );
+            images.entry(repository.clone()).or_default().push(
+                FlatpakOciIndexImage {
+                    digest: digest.clone(),
+                    mediatype: MANIFEST_MEDIA_TYPE.to_string(),
+                    os: "linux".to_string(),
+                    architecture: arch.to_string(),
+                    annotations: Default::default(),
+                    labels,
+                    tags: vec![],
+                },
+            );
+        }
+    }
+
+    let body = FlatpakOciIndexResponse {
+        registry: state
+            .public_url
+            .as_deref()
+            .unwrap_or_default()
+            .trim_end_matches('/')
+            .to_string(),
+        results: images
+            .into_iter()
+            .map(|(name, mut images)| {
+                // the summary builder sorts by ref
+                images.sort_by(|a, b| {
+                    a.annotations
+                        .get(crate::ANNOTATION_FLATPAK_REF)
+                        .cmp(&b.annotations.get(crate::ANNOTATION_FLATPAK_REF))
+                });
+                FlatpakOciIndexRepository { name, images }
+            })
+            .collect(),
+    };
+    let json = serde_json::to_vec(&body).expect("serializing the OCI index");
+    use sha2::Digest as _;
+    let etag = format!("\"{:x}\"", sha2::Sha256::digest(&json));
+    (
+        [(axum::http::header::ETAG, etag)],
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        json,
+    )
+}
+
+/// GET /v2/: the distribution API ping some clients make first.
+async fn v2_ping() -> &'static str {
+    "{}"
+}
+
+/// GET /v2/{rest}: proxy the OCI distribution API against the URLs the
+/// verified catalog carries. Manifests resolve against a row's
+/// `location`, blobs against its `oci_assets` entries. Everything is
+/// digest-addressed, so a row matches by exact URL tail and the bytes
+/// relayed are the bytes the publisher signed.
+async fn v2_proxy(
+    State(state): State<ServerState>,
+    AxumPath(rest): AxumPath<String>,
+) -> axum::response::Response {
+    let needle = format!("/v2/{rest}");
+    let document = state.document.document();
+    let mut upstream: Option<String> = None;
+    'rows: for app in &document.apps {
+        if app.location.ends_with(&needle) {
+            upstream = Some(app.location.clone());
+            break;
+        }
+        let Some(assets) = &app.oci_assets else {
+            continue;
+        };
+        for asset in assets {
+            if asset.url.ends_with(&needle) {
+                upstream = Some(asset.url.clone());
+                break 'rows;
+            }
+        }
+    }
+    let Some(url) = upstream else {
+        return axum::http::StatusCode::NOT_FOUND.into_response();
+    };
+
+    // The bearer dance: publisher registries (ghcr included) answer an
+    // anonymous pull with 401 + WWW-Authenticate; flatpak would give
+    // up here (the M5 lesson: it never even tries a token), indexd
+    // does the dance and relays the bytes.
+    let agent = ureq::AgentBuilder::new()
+        .timeout(std::time::Duration::from_secs(300))
+        .build();
+    let response = match if url.contains("/manifests/") {
+        // registries reject a manifest GET whose Accept names no
+        // manifest media type (distribution 3.x 404s it)
+        agent
+            .get(&url)
+            .set(
+                "Accept",
+                "application/vnd.oci.image.manifest.v1+json, \
+                 application/vnd.oci.image.index.v1+json, \
+                 application/vnd.docker.distribution.manifest.v2+json, \
+                 application/vnd.docker.distribution.manifest.list.v2+json",
+            )
+            .call()
+    } else {
+        agent.get(&url).call()
+    } {
+        Ok(response) => response,
+        Err(ureq::Error::Status(401, denied)) => {
+            let Some(challenge) = denied.header("www-authenticate") else {
+                return axum::http::StatusCode::BAD_GATEWAY.into_response();
+            };
+            let Some(token) = bearer_token(challenge, &needle) else {
+                return axum::http::StatusCode::BAD_GATEWAY.into_response();
+            };
+            match agent.get(&url).set("Authorization", &token).call() {
+                Ok(response) => response,
+                Err(_) => return axum::http::StatusCode::BAD_GATEWAY.into_response(),
+            }
+        }
+        Err(_) => return axum::http::StatusCode::BAD_GATEWAY.into_response(),
+    };
+    let content_type = response
+        .header("content-type")
+        .unwrap_or("application/octet-stream")
+        .to_string();
+
+    // Relay the body without blocking the runtime: the reader runs on
+    // a dedicated thread (blobs are hundreds of MB and the GUI runs
+    // this whole service on a current-thread tokio runtime), chunks
+    // cross to the response through a bounded channel.
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(8);
+    std::thread::spawn(move || {
+        let mut reader = response.into_reader();
+        let mut buf = vec![0u8; 64 * 1024];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if tx
+                        .blocking_send(Ok(bytes::Bytes::copy_from_slice(&buf[..n])))
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Err(err) => {
+                    let _ = tx.blocking_send(Err(err));
+                    break;
+                }
+            }
+        }
+    });
+    (
+        [(axum::http::header::CONTENT_TYPE, content_type)],
+        axum::body::Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx)),
+    )
+        .into_response()
+}
+
+/// Parse a WWW-Authenticate Bearer challenge and fetch the pull token
+/// for one repository. Only what the registries in front of Orchard
+/// send today: realm, service, scope.
+fn bearer_token(challenge: &str, path: &str) -> Option<String> {
+    let rest = challenge.strip_prefix("Bearer ")?;
+    let mut realm = None;
+    let mut service = None;
+    let mut scope = None;
+    for part in rest.split(',') {
+        let part = part.trim();
+        if let Some(value) = part.strip_prefix("realm=") {
+            realm = Some(value.trim_matches('"').to_string());
+        } else if let Some(value) = part.strip_prefix("service=") {
+            service = Some(value.trim_matches('"').to_string());
+        } else if let Some(value) = part.strip_prefix("scope=") {
+            scope = Some(value.trim_matches('"').to_string());
+        }
+    }
+    let realm = realm?;
+    // the challenge's scope names the repository it denied; reuse it
+    // when present, else ask for the path we wanted
+    let scope = scope.unwrap_or_else(|| format!("repository:{}:pull", path.trim_start_matches("/v2/").split("/manifests/").next().unwrap_or("")));
+    let mut url = format!("{realm}?scope={}", uri_escape(&scope));
+    if let Some(service) = service {
+        url.push_str(&format!("&service={}", uri_escape(&service)));
+    }
+    let agent = ureq::AgentBuilder::new()
+        .timeout(std::time::Duration::from_secs(30))
+        .build();
+    let response = agent.get(&url).call().ok()?;
+    let json: serde_json::Value = response.into_json().ok()?;
+    json["token"].as_str().map(|t| t.to_string())
+}
+
+/// Percent-encode the few characters a query value may not carry.
+fn uri_escape(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b':' | b'/' => {
+                out.push(byte as char)
+            }
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
+}
+
 /// Clear absorbed events: the feed refills from the relays on their
 /// next pass, and the disk cache empties on the writer's next tick.
 async fn clear_cache(State(state): State<ServerState>) -> &'static str {
@@ -690,6 +1044,14 @@ pub async fn serve(
         }),
         relays_reset: Some(relays_reset),
         relays_health: Some(relays_health),
+        // the Registry name /index/static advertises: the operator's
+        // public base when set (a reverse proxy in front), else this
+        // process's own bind address
+        public_url: Some(
+            state
+                .public_url
+                .unwrap_or_else(|| format!("http://{addr}")),
+        ),
     };
     // A restart races the previous instance's dying listener for the
     // port, and losing that race used to cost the whole session: the
@@ -908,14 +1270,14 @@ mod tests {
                     nip05: None,
                 },
                 version: "1.0.0".into(),
-                platforms: Vec::new(),
+                platforms: vec!["linux-x86_64".into()],
                 flatpak_ref: "app/com.orchard.Hello/x86_64/stable".into(),
                 branch: "stable".into(),
                 channels: Vec::new(),
-                location: "oci:/tmp/demo".into(),
+                location: "http://registry.example.com/v2/hello/manifests/sha256:00".into(),
                 digest: Some("sha256:00".into()),
                 oci_assets: None,
-                metadata: None,
+                metadata: Some("[Application]\nname=Orchard Hello".into()),
                 repository: None,
                 homepage: None,
                 notes: None,
@@ -932,6 +1294,7 @@ mod tests {
             document: Arc::new(catalog.clone()),
             relays_reset: None,
             relays_health: None,
+            public_url: None,
         });
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -983,6 +1346,7 @@ mod tests {
             document: Arc::new(sample_catalog()),
             relays_reset: None,
             relays_health: None,
+            public_url: None,
         });
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1037,6 +1401,7 @@ mod tests {
             document: Arc::new(sample_catalog()),
             relays_reset: None,
             relays_health: Some(map),
+            public_url: None,
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1061,6 +1426,51 @@ mod tests {
         assert_eq!(down["connected"], false);
         assert_eq!(down["failures"], 3);
         assert_eq!(down["last_error"], "connection refused");
+
+        server.abort();
+    }
+
+    #[test]
+    fn registry_location_parses() {
+        let (host, name) = parse_registry_location(
+            "http://127.0.0.1:5000/v2/hello/manifests/sha256:abc",
+        )
+        .unwrap();
+        assert_eq!(host, "127.0.0.1:5000");
+        assert_eq!(name, "hello");
+        assert!(parse_registry_location("file:///some/layout").is_none());
+        assert!(parse_registry_location("https://ghcr.io/v2/a/b/manifests/sha256:x").is_some());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn index_static_serves_flatpaks_names() {
+        let router = router(ServerState {
+            document: Arc::new(sample_catalog()),
+            relays_reset: None,
+            relays_health: None,
+            public_url: Some("https://index.example.com".into()),
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+
+        let agent = ureq::AgentBuilder::new().build();
+        let body: serde_json::Value = agent
+            .get(&format!("http://{addr}/index/static"))
+            .call()
+            .unwrap()
+            .into_json()
+            .unwrap();
+        // member names are flatpak's literals, not the OCI spec's
+        assert!(body.get("Registry").is_some());
+        assert!(body.get("results").is_none());
+        let image = &body["Results"][0]["Images"][0];
+        assert!(image["Digest"].as_str().unwrap().starts_with("sha256:"));
+        assert_eq!(image["Labels"]["org.flatpak.ref"], "app/com.orchard.Hello/x86_64/stable");
+        // Registry resolves relative to the index URI: absolute when set
+        assert_eq!(body["Registry"], "https://index.example.com");
 
         server.abort();
     }

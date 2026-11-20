@@ -1,0 +1,36 @@
+# orchard-indexd, hosted (no client): the catalog document and every
+# protocol surface in front of it, including the flatpak OCI remote
+# surface (/index/static + /v2 proxy). Install as a user unit (or a
+# system unit with User=); adjust paths and flags per deployment.
+#
+#   flatpak remote-add --if-not-exists --oci orchard \
+#     oci+https://index.example.com
+#
+# Unit file install (user):
+#   mkdir -p ~/.config/systemd/user
+#   cp packaging/systemd/orchard-indexd.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload && systemctl --user enable --now orchard-indexd
+
+[Unit]
+Description=Orchard index daemon (catalog and flatpak OCI remote)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/orchard-indexd --listen 127.0.0.1:7780
+# Relays to subscribe to (beats settings.json; --relays sets it here).
+Environment=ORCHARD_RELAYS=wss://relay.example.com
+# Hosted-only: the externally-visible base URL (the reverse proxy's
+# https:// host) that /index/static names as Registry. Leave unset for
+# a loopback-only daemon serving the local client.
+#Environment=ORCHARD_PUBLIC_URL=https://index.example.com
+Restart=on-failure
+RestartSec=5s
+# A local daemon carries no secrets; harden anyway.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+
+[Install]
+WantedBy=default.target

@@ -117,13 +117,40 @@ real publish. The local dry run must override both:
     ORCHARD_NSEC=<key> ./target/release/orchard-publish self/orchard.publish.toml \
       --registry https://localhost:5000/orchard --relays ws://127.0.0.1:8008
 
+## The catalog as a flatpak remote
+
+Orchard's catalog is a real flatpak remote, with or without the GUI. The
+client registers it itself: while an Orchard session runs, the in-process
+indexd serves the catalog at `oci+http://127.0.0.1:7780` and the remote
+`orchard` appears in `flatpak remotes`, so `flatpak search`, `flatpak
+install orchard/<app-id>`, `flatpak update`, GNOME Software, and Discover
+all see Orchard apps (user installation; GNOME Software may show apps as
+available until it queries user installs).
+
+Hosted (no GUI): run `orchard-indexd` anywhere and point flatpak at it.
+
+    orchard-indexd --listen 127.0.0.1:7780 --relays wss://relay.orchard.rocks
+    # hosted: --public-url https://index.example.com, TLS at your reverse proxy
+    flatpak remote-add --if-not-exists --oci --user orchard \
+      --title=Orchard --homepage=https://orchard.rocks \
+      oci+https://index.example.com
+
+Rules the docs keep honest: orchard serves apps, Flathub serves runtimes
+(a consumer needs Flathub enabled); the summary covers OCI images, so
+Zapstore-shaped `.flatpak` bundles stay a client-only channel; and
+uninstalling Orchard leaves the `orchard` remote behind (flatpak has no
+post-uninstall hook). Remove it with `flatpak remote-delete orchard`; a
+dead loopback remote fails fast rather than hanging. Hosted deployments
+use the systemd unit in `packaging/systemd/orchard-indexd.service`.
+
 ## Layout
 
 - `crates/orchard-core`: domain model, AppStream parser, OCI verifier,
   permissions translator.
 - `crates/orchard-flatpak`: the single seam to the flatpak CLI.
 - `crates/orchard-indexd`: the local catalog service (embedded in the
-  client), relay sessions, event cache.
+  client), relay sessions, event cache, and the flatpak OCI remote
+  surface (`/index/static` and the digest-pinned `/v2` proxy).
 - `crates/orchard-nostr`: event model, builders, and the verified feed.
 - `crates/orchard`: the GPUI client.
 - `crates/orchard-publish`: the publisher CLI (`PUBLISHING.md`).

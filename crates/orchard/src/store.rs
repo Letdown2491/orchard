@@ -9500,7 +9500,6 @@ fn relay_status_badge(status: &RelayStatus) -> gpui::Div {
 struct RelayStatus {
     connected: bool,
     last_frame_age_secs: Option<u64>,
-    last_error: Option<String>,
     failures: u32,
 }
 
@@ -9533,10 +9532,6 @@ fn load_relay_health() -> std::collections::BTreeMap<String, RelayStatus> {
                             last_frame_age_secs: row
                                 .get("last_frame_age_secs")
                                 .and_then(|age| age.as_u64()),
-                            last_error: row
-                                .get("last_error")
-                                .and_then(|err| err.as_str())
-                                .map(|err| err.to_string()),
                             failures: row.get("failures")?.as_u64()? as u32,
                         },
                     ))
