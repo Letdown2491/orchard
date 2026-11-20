@@ -1,0 +1,151 @@
+# Release: a tag builds the Linux packages and attaches them to the
+# release: the deb (cargo-deb), the rpm (cargo-generate-rpm), the apk
+# (abuild in an alpine:3.22 musl container), and the Arch pkg (makepkg
+# in an archlinux container). Packages are issue #1's channels; the
+# flatpak channel is self-publish.yml (same tags, separate workflow so
+# the NIP-82 publish stays reviewable on its own).
+#
+# Trigger: push a tag shaped v0.1.0 (the v prefix matches the tag
+# convention). Everything else (draft text, the version bump itself)
+# is manual, on purpose: a release is a claim, not a side effect. The
+# guard step refuses a tag that disagrees with the workspace version,
+# because the deb and rpm versions come from Cargo.toml, not the tag.
+#
+# Secrets:
+#   APK_SIGN_PRIVATE_KEY  the persistent abuild signing key: the same
+#                 key signs every apk release, on both architectures,
+#                 so users trust the shipped .pub once (unset on local
+#                 builds, which fall back to a throwaway key).
+
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  deb-rpm:
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+          - runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: The tag and the workspace version agree
+        run: |
+          version=$(cargo pkgid -p orchard | cut -d'#' -f2)
+          echo "crate $version, tag ${GITHUB_REF_NAME#v}"
+          test "$version" = "${GITHUB_REF_NAME#v}"
+
+      - name: Install the Rust toolchain
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch head
+
+      - name: Install the client libraries orchard links
+        # The linked set (ldd): libxcb, libxkbcommon, libxkbcommon-x11.
+        # fontconfig and freetype are gpui's build-time link deps; the
+        # dlopened set (strace: libwayland-client, libvulkan) is NOT
+        # needed to build, only to run, and is encoded in the package
+        # metadata instead.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            pkg-config \
+            libfontconfig-dev \
+            libfreetype-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev \
+            libwayland-dev \
+            libxcb1-dev \
+            libvulkan-dev
+
+      - name: Build the release binary
+        run: cargo build --release --locked -p orchard
+
+      - name: Build the deb
+        run: |
+          cargo install cargo-deb --locked --version 3.8.0
+          cargo deb -p orchard --no-build
+          # Smoke: the deb parses and its payload carries the expected paths.
+          dpkg-deb --info target/debian/*.deb | head -20
+
+      - name: Build the rpm
+        run: |
+          cargo install cargo-generate-rpm --locked --version 0.21.1
+          # -p takes the package DIRECTORY path, not the crate name.
+          cargo generate-rpm -p crates/orchard
+          # Smoke: the rpm reads back (rpmlint is not installed; the
+          # header listing is the check).
+          rpm -q --info target/generate-rpm/*.rpm || rpm2cpio target/generate-rpm/*.rpm | cpio -it | head
+
+      - name: Attach the deb and rpm to the release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
+        with:
+          files: |
+            target/debian/*.deb
+            target/generate-rpm/*.rpm
+          generate_release_notes: true
+
+  apk:
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+          - runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Build the apk (alpine 3.22, musl)
+        # Digest-pinned (the tag alpine:3.22 at pinning time; the same
+        # digest satori-desktop pins: the index resolves per arch, so
+        # one pin serves both runners). packaging/build-apk.sh is the
+        # ONE code path (CI and local builds); it carries the musl
+        # spike's findings (rustup over the system cargo, the world-
+        # readable key copy, one :Z volume at a time).
+        env:
+          APK_SIGN_PRIVATE_KEY: ${{ secrets.APK_SIGN_PRIVATE_KEY }}
+        run: |
+          podman run --rm -v "$PWD:/srv:Z" -w /srv \
+            -e APK_SIGN_PRIVATE_KEY \
+            alpine:3.22@sha256:49340b346798875b5592e5d420241f2f9cfba5f47e62ebb1446a1b34734e898f \
+            sh packaging/build-apk.sh "${GITHUB_REF_NAME#v}"
+
+      - name: Attach the apk and its public key to the release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
+        with:
+          files: |
+            packaging/apk/out/*.apk
+            packaging/apk/out/*.pub
+          generate_release_notes: true
+
+  arch:
+    # x86_64 only for now: the arm64v8 archlinux image leg is untested
+    # (the deb/rpm/apk legs carry both architectures). A follow-up
+    # brings the arm leg once this one is proven on a tag.
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Build the Arch pkg (makepkg, builder user)
+        run: |
+          podman run --rm -v "$PWD:/srv:Z" -w /srv \
+            archlinux:base-devel@sha256:97119fd9e21219b02b3c14ba256c9d3c0d031d07fc26c836c41ed793beeb5b74 \
+            sh packaging/build-pkg.sh "${GITHUB_REF_NAME#v}"
+
+      - name: Attach the pkg to the release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
+        with:
+          files: packaging/arch/out/*.pkg.tar.zst
+          generate_release_notes: true

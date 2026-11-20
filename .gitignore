@@ -6,3 +6,5 @@
 /self/tree/files/
 /lib/libxkbcommon-x11.so.0
 /tmp/
+packaging/apk/out/
+packaging/arch/out/

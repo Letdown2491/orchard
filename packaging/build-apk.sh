@@ -42,6 +42,12 @@ chmod 0440 /etc/sudoers.d/builder
 mkdir -p /var/cache/distfiles
 chown root:abuild /var/cache/distfiles
 chmod g+w /var/cache/distfiles
+# Local testing without a pushed tag: LOCAL_TARBALL (a mounted-in git
+# archive tarball, GitHub layout) lands in SRCDEST before abuild runs,
+# and abuild then skips the GitHub fetch. CI leaves it unset.
+if [ -n "${LOCAL_TARBALL:-}" ]; then
+	cp "$LOCAL_TARBALL" "/var/cache/distfiles/orchard-$VERSION.tar.gz"
+fi
 mkdir -p "$WORK" /srv/packaging/apk/out
 cp packaging/apk/APKBUILD "$WORK"/APKBUILD
 # The version is the caller's truth (CI: the tag; local: the argument),
@@ -87,8 +93,12 @@ cp /home/builder/.abuild/*.pub /etc/apk/keys/ 2>/dev/null || true
 # ours must be too.
 chmod 0644 /etc/apk/keys/*.pub 2>/dev/null || true
 # The canary: fail HERE, at setup, if the builder cannot read the key:
-# not forty lines later inside abuild's signing step.
-su builder -c "test -r /home/builder/.abuild/$KEYNAME.rsa.pub"
+# not forty lines later inside abuild's signing step. The file's NAME
+# differs by branch (the secret branch names it $KEYNAME.rsa.pub, the
+# keygen branch builder-<hash>.rsa.pub), so test whichever exists.
+for pub in /home/builder/.abuild/*.rsa.pub; do
+	su builder -c "test -r $pub"
+done
 
 # abuild fetches the tag tarball from GitHub (network; skipped when the
 # tarball already sits in SRCDEST, the local-test path), verifies

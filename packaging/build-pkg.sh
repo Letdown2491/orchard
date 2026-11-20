@@ -55,5 +55,9 @@ chown -R builder:builder /home/builder
 # the source may have been built before; -s: install missing deps.
 su builder -c "cd $WORK && makepkg -sf --noconfirm"
 
-mv "$WORK"/orchard-*.pkg.tar.zst /srv/packaging/arch/out/
+mv "$WORK"/orchard-*.pkg.tar.zst /srv/packaging/arch/out/ 2>/dev/null || true
+# makepkg's default OPTIONS strip the binary and package the symbols as
+# a separate -debug pkg: the release page wants the package only (the
+# distro convention routes debug pkgs to a debug repo we do not run).
+rm -f /srv/packaging/arch/out/orchard-debug-*.pkg.tar.zst
 ls -la /srv/packaging/arch/out/
