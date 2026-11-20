@@ -117,6 +117,13 @@ distribution infrastructure stays at zero central servers.
   verify is the first and only download.
 - **Bootstrap:** `curl` the release's per-arch oci-archive and
   `flatpak install --user oci-archive:` ; every later update flows through the catalog.
+  The bootstrap is the one step with no digest chain under it, so the first copy is
+  checkable through a second channel: every release artifact wears a minisign signature,
+  the public key committed at `packaging/minisign.pub` (key id `6C74D7A0EC178629`), the
+  secret half a GitHub secret.
+  Signature and key travel different channels (release vs repo); the catalog events pin
+  the same digests from the publisher identity, so the two channels do not share a
+  failure mode.
 - **Runtime convention:** apps default to runtimes hosted on the flathub remote, so
   runtimes are shared; self-contained images are an explicit opt-in.
 - **Publish CLI (`orchard-publish`):** manifest → build → OCI push → sign → Nostr
