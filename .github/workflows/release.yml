@@ -122,7 +122,6 @@ jobs:
             target/generate-rpm/*.rpm
             target/generate-rpm/*.rpm.minisig
             packaging/minisign.pub
-          generate_release_notes: true
 
   apk:
     strategy:
@@ -179,7 +178,6 @@ jobs:
             packaging/apk/out/*.apk.minisig
             packaging/apk/out/*.pub
             packaging/minisign.pub
-          generate_release_notes: true
 
   arch:
     # x86_64 only for now: the arm64v8 archlinux image leg is untested
@@ -221,4 +219,35 @@ jobs:
             packaging/arch/out/*.pkg.tar.zst
             packaging/arch/out/*.pkg.tar.zst.minisig
             packaging/minisign.pub
-          generate_release_notes: true
+
+  notes:
+    # one writer: the matrix legs race to attach (the first create makes
+    # the release, the rest update it), and self-publish may create the
+    # release too; the body is set once, after every attachment, from
+    # this tag's CHANGELOG section (the auto-generated notes carried
+    # only a compare link, and one per racing writer on top)
+    needs: [deb-rpm, apk, arch]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Set the release notes from the changelog
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          # the changelog is hard-wrapped at editing width; unwrap the
+          # continuation lines so each bullet renders as one line
+          awk '
+            function flush() { if (buf != "") print buf; buf = "" }
+            /^$/ { flush(); print ""; next }
+            /^ / { gsub(/^ +/, ""); buf = (buf == "" ? $0 : buf " " $0); next }
+            { flush(); buf = $0; next }
+            END { flush() }
+          ' <(awk -v ver="$tag" '
+            $0 ~ "^## v" ver " \\(" {on=1; next}
+            /^## v/ && on {exit}
+            on {print}
+          ' CHANGELOG.md) > /tmp/opencode-notes.md
+          [ -s /tmp/opencode-notes.md ] || { echo "no CHANGELOG section for v$tag" >&2; exit 1; }
+          gh release edit "$GITHUB_REF_NAME" --notes-file /tmp/opencode-notes.md -R "$GITHUB_REPOSITORY"
