@@ -8,6 +8,10 @@ URLs do. What Orchard carries is small signed metadata, a few KB per app.
 
     orchard-publish app.publish.toml --registry ghcr.io/you/your-app
 
+(`ghcr` is GitHub Container Registry; the examples use it because
+Orchard's own CI does, but any OCI registry works, and there is a
+no-registry path described below.)
+
 Your registry serves the artifact; the events pin it by digest; the client
 verifies one against the other before any install. What you sign is what
 installs.
@@ -17,9 +21,11 @@ installs.
 1. **An app tree.** The flatpak layout: `files/` (the app), `metadata`
    (the sandbox ini), `export/` (desktop file and AppStream, what
    `flatpak build-export` produces).
-2. **An OCI registry you can push to.** ghcr, quay, or self-hosted. The
-   artifact is a plain OCI image; nothing about it is Orchard-specific
-   beyond its config labels.
+2. **An OCI registry you can push to.** Any OCI-compliant registry works:
+   GitHub Container Registry (ghcr.io), Red Hat's quay.io, or self-hosted.
+   Nothing about the artifact is Orchard-specific beyond its config
+   labels. You can also skip the registry entirely and host the files on
+   a Blossom server instead (see "Publish to a registry").
 3. **A Nostr key.** The publisher identity. Its public key is your name on
    Orchard: it signs every release, reviews attach to it, clients pin it.
 4. **The `orchard-publish` CLI.** Not on crates.io: build it from the
@@ -262,6 +268,8 @@ only those metadata files:
 Without `--registry`, publication verifies the hosted manifest and config rather
 than requiring local layouts or manifest files. It checks the manifest hash,
 size and Flatpak app/architecture ref before signing the complete release.
+
+### Or no registry at all: Blossom
 
 For Blossom, upload the manifest, config and layers as individual blobs using
 your chosen publisher. Fill the top-level `url` and each `components[].url`
