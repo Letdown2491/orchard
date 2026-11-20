@@ -145,7 +145,7 @@ Hosted (no GUI): run `orchard-indexd` anywhere and point flatpak at it.
 
     orchard-indexd --listen 127.0.0.1:7780 --relays wss://relay.orchard.rocks
     # hosted: --public-url https://index.example.com, TLS at your reverse proxy
-    flatpak remote-add --if-not-exists --oci --user orchard \
+    flatpak remote-add --if-not-exists --user orchard \
       --title=Orchard --homepage=https://orchard.rocks \
       oci+https://index.example.com
 

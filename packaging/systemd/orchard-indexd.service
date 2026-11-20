@@ -3,7 +3,7 @@
 # surface (/index/static + /v2 proxy). Install as a user unit (or a
 # system unit with User=); adjust paths and flags per deployment.
 #
-#   flatpak remote-add --if-not-exists --oci orchard \
+#   flatpak remote-add --if-not-exists orchard \
 #     oci+https://index.example.com
 #
 # Unit file install (user):

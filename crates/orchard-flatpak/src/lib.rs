@@ -59,14 +59,15 @@ pub fn flatpak_command() -> Command {
 /// comes from the index's Labels member (the ref key is
 /// `org.flatpak.ref`), and a manifest GET without an Accept header
 /// naming manifest media types is 404ed by some registries, which is
-/// why indexd's proxy sends one. `--if-not-exists` keeps this
+/// why indexd's proxy sends one. There is no `remote-add --oci` flag:
+/// the `oci+` scheme is what marks the remote (observed: flatpak 1.18.4
+/// rejects `--oci` as unknown). `--if-not-exists` keeps this
 /// idempotent: the client runs it at every startup.
 pub fn ensure_oci_remote(index_url: &str) -> Command {
     let mut cmd = flatpak_command();
     cmd.args([
         "remote-add",
         "--if-not-exists",
-        "--oci",
         "--user",
         REMOTE_NAME,
         index_url,
@@ -564,7 +565,9 @@ mod tests {
     fn remote_add_is_oci() {
         let cmd = ensure_oci_remote("oci+http://127.0.0.1:7780");
         let args = arg_strings(&cmd);
-        assert!(args.contains(&"--oci".to_string()));
+        // no --oci flag: flatpak 1.18.4 rejects it as unknown, the
+        // oci+ scheme is what marks the remote
+        assert!(!args.contains(&"--oci".to_string()));
         assert!(args.contains(&"--if-not-exists".to_string()));
         assert!(args.contains(&"oci+http://127.0.0.1:7780".to_string()));
         assert!(args.contains(&REMOTE_NAME.to_string()));
