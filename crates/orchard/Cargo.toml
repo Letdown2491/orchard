@@ -6,6 +6,62 @@ edition.workspace = true
 license.workspace = true
 publish = false
 
+# The deb and rpm metadata for the release CI (issue #1). cargo-deb reads
+# ONLY [package.metadata.deb]: a `cargo-deb`-named table is silently
+# ignored (explicit assets vanish, control falls back to the [package]
+# defaults). satori-desktop's first deb shipped without its desktop file,
+# metainfo, and icon because of exactly this.
+[package.metadata.deb]
+maintainer = "martin <github.penknife946@passmail.net>"
+license-file = ["../../LICENSE", "0"]
+depends = "$auto"
+# The dlopened set (strace, 2026-11-20): ldd cannot see it. Everything
+# linked arrives through $auto (dpkg-shlibdeps); libX11-xcb rides the
+# xkbcommon-x11 chain.
+recommends = "libwayland-client0, libvulkan1"
+extended-description = """\
+A store with no central server: publishers sign their releases with \
+their own Nostr keys, the catalog is a feed of those signatures, and \
+every artifact is pinned to the digest the publisher signed before a \
+single byte installs. Apps install as ordinary flatpaks and keep \
+updating through flatpak itself."""
+section = "net"
+assets = [
+    ["target/release/orchard", "usr/bin/", "755"],
+    ["../../packaging/rocks.orchard.Orchard.desktop", "usr/share/applications/", "644"],
+    ["../../packaging/rocks.orchard.Orchard.metainfo.xml", "usr/share/metainfo/", "644"],
+    ["../../assets/orchard-512.png", "usr/share/icons/hicolor/512x512/apps/rocks.orchard.Orchard.png", "644"],
+    ["../../assets/orchard-128.png", "usr/share/icons/hicolor/128x128/apps/rocks.orchard.Orchard.png", "644"],
+]
+conflicts = "rocks.orchard.Orchard"
+provides = "rocks.orchard.Orchard"
+
+[package.metadata.generate-rpm]
+maintainer = "martin <github.penknife946@passmail.net>"
+license = "MIT"
+summary = "The permissionless Flatpak store"
+group = "Applications/Internet"
+post_install_script = """
+if command -v update-desktop-database >/dev/null 2>&1; then update-desktop-database >/dev/null 2>&1 || true; fi
+"""
+assets = [
+    { source = "target/release/orchard", dest = "/usr/bin/orchard", mode = "755" },
+    { source = "packaging/rocks.orchard.Orchard.desktop", dest = "/usr/share/applications/rocks.orchard.Orchard.desktop", mode = "644" },
+    { source = "packaging/rocks.orchard.Orchard.metainfo.xml", dest = "/usr/share/metainfo/rocks.orchard.Orchard.metainfo.xml", mode = "644" },
+    { source = "assets/orchard-512.png", dest = "/usr/share/icons/hicolor/512x512/apps/rocks.orchard.Orchard.png", mode = "644" },
+    { source = "assets/orchard-128.png", dest = "/usr/share/icons/hicolor/128x128/apps/rocks.orchard.Orchard.png", mode = "644" },
+]
+# The dlopened set (strace, 2026-11-20): weak deps in practice, but the
+# app cannot render without wayland-client, and vulkan is the GL
+# backend. RPM auto-req picks up the linked shared libraries by itself.
+[package.metadata.generate-rpm.requires]
+libwayland-client = ""
+vulkan-loader = ""
+[package.metadata.generate-rpm.conflicts]
+"rocks.orchard.Orchard" = ""
+[package.metadata.generate-rpm.provides]
+"rocks.orchard.Orchard" = ""
+
 [dependencies]
 anyhow = { workspace = true }
 gpui = { workspace = true }

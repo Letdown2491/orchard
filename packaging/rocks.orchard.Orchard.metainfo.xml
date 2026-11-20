@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>rocks.orchard.Orchard</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+  <name>Orchard</name>
+  <summary>The permissionless Flatpak store</summary>
+  <description>
+    <p>
+      A store with no central server: publishers sign their releases
+      with their own Nostr keys, the catalog is a feed of those
+      signatures, and every artifact is pinned to the digest the
+      publisher signed before a single byte installs. A GPU-rendered
+      client renders that feed as a normal app store: search, app
+      pages, release notes, a permissions viewer built from the real
+      sandbox profile, reviews from the people you actually trust.
+    </p>
+    <p>
+      Apps install as ordinary flatpaks and keep updating through
+      flatpak itself; Flathub's catalog appears alongside publisher
+      channels as just another source. Orchard distributes itself the
+      same way it distributes everyone else.
+    </p>
+  </description>
+  <categories>
+    <category>Network</category>
+    <category>PackageManager</category>
+  </categories>
+  <launchable type="desktop-id">rocks.orchard.Orchard.desktop</launchable>
+  <url type="homepage">https://github.com/Letdown2491/orchard</url>
+  <url type="bugtracker">https://github.com/Letdown2491/orchard/issues</url>
+</component>

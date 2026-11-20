@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Application
+Name=Orchard
+GenericName=Package Manager
+Comment=The permissionless Flatpak store
+Exec=orchard %u
+Icon=rocks.orchard.Orchard
+Terminal=false
+Categories=Network;PackageManager;
+Keywords=flatpak;orchard;store;nostr;
+MimeType=x-scheme-handler/orchard;
+StartupNotify=true
+# X11 sessions fall back to WM_CLASS; Wayland matches the app_id (main.rs).
+StartupWMClass=rocks.orchard.Orchard
