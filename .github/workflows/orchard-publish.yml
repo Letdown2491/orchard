@@ -73,7 +73,7 @@ on:
         description: Optional minisign key (issue #8): the release's oci-archive wears a .minisig
         required: false
       REGISTRY_USER:
-        description: Registry login; ghcr needs ${{ github.actor }}; GITHUB_TOKEN works
+        description: Registry login; ghcr needs the workflow actor; GITHUB_TOKEN works
         required: false
       REGISTRY_PASSWORD:
         description: Registry password/token
