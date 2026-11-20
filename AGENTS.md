@@ -85,3 +85,17 @@ lives in the container layer: it survives `podman restart`, not
 protocol draft, and the milestone history. `PUBLISHING.md` is the
 publisher guide; keep it accurate when the publish path changes. Update
 DESIGN.md when a decision changes.
+
+## Releases (learned 2026-11-20)
+
+The self-release sequence is in PUBLISHING.md ("Cutting an Orchard
+release (self)"): changelog section first, then the version bump in
+the manifest and the workspace together, tag last; the tag freezes the
+manifest, so late edits do not publish (0.5.1 exists for exactly
+this). Reusable workflow files have authoring rules GitHub enforces
+with opaque 0-second failed runs: no `${{ }}` in input/secret
+descriptions, no `default:` on secret inputs, and the declared push
+trigger whose runs are green no-ops (PUBLISHING.md, "Reusable
+workflow file gotchas"). Set CI secrets with `gh secret set ... <
+file`, never a web paste: a pasted key failed every sign step of the
+first 0.5.0 attempt.

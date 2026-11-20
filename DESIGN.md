@@ -309,11 +309,12 @@ binary is multiplexed, so `flatpak run <app-id> search foo` works inside the fla
 with no second exported binary.
 
 - **Shared job engine:** the install, update, and remove paths (digest verification
-  against the release pin, runtime pre-flight, the uninstall-then-install update
-  seam, the believe-it-only-when-a-fresh-installation-list-agrees verdict, and the
-  confirm disclosure data) are extracted from the GPUI store into a headless crate
-  the GUI and the CLI both call. The CLI never re-implements the seam; this
-  extraction is the bulk of the work and lands first.
+  against the release pin, runtime pre-flight, the update seam (uninstall-then-
+  install for direct-path installs, retired for the client's remote-addressed
+  installs, see Decisions), the believe-it-only-when-a-fresh-installation-list-agrees
+  verdict, and the confirm disclosure data) are extracted from the GPUI store into a
+  headless crate the GUI and the CLI both call. The CLI never re-implements the seam;
+  this extraction is the bulk of the work and lands first.
 - **Commands:** `search`, `info`, `install`, `update`, `remove`, `list`,
   `relays list|add|remove|reset`.
 - **Catalog:** reuse a running client's indexd on `127.0.0.1:7780` when it answers

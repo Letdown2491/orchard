@@ -448,6 +448,13 @@ wrong one:
   caller must publish their public key themselves (it lives in their
   repo, which is fine: verifiers need it by some channel).
 
+Release notes are the changelog: release.yml's final `notes` job sets
+the release body from the tag's CHANGELOG section, once, after every
+attachment has landed (the matrix legs race to create the release, and
+GitHub's auto-generated notes append per write: on v0.5.0 they stacked
+six "Full Changelog" blocks and no actual changes). Cut a release by
+writing its section into CHANGELOG.md first, header `## vX.Y.Z (date)`.
+
 ```yaml
 name: publish
 
@@ -701,6 +708,40 @@ repository for reuse, point the listing at the PNG.
 - [ ] Profile published once (`author-name`, `nip05`) and only re-signed
       when it changes.
 - [ ] Tag pushed: `v*` is the publish switch; branch pushes publish nothing.
+
+## Cutting an Orchard release (self)
+
+Orchard's own releases ride the same publish path (`self-publish.yml`
+plus `release.yml` on a `v*` tag). 0.5.0 cost a 0.5.1 to learn the
+order; the sequence that works:
+
+1. Write the CHANGELOG.md section first (header `## vX.Y.Z (date)`):
+   `release.yml`'s `notes` job sets the GitHub release body from it,
+   and the self manifest's `notes` should compress the same changes
+   into the one line clients render.
+2. Bump the version in both frozen-together places:
+   `self/orchard.publish.toml` `[release] version` and the workspace
+   `Cargo.toml` (all crates inherit; the six `orchard*` entries in
+   `Cargo.lock` move with it). The release CI refuses a tag that
+   disagrees with the workspace version.
+3. Commit, push `main`, then tag and push the tag: `release.yml`
+   (native packages) and `self-publish.yml` (oci-archive, ghcr, NIP-82
+   events) fire together. The tag freezes the manifest; edits after
+   tagging do not publish (that is why 0.5.1 exists).
+4. Watch both runs; on green, verify like a client:
+   `minisign -Vm <archive> -p packaging/minisign.pub`, the relay acks
+   in the publish job's log, then the update through the GUI.
+
+Two gotchas that have both already cost a release attempt:
+
+- Set CI secrets from the file, never a web paste:
+  `gh secret set MINISIGN_SECRET_KEY -R Letdown2491/orchard <
+  ~/.minisign/minisign.key`. A pasted key failed every sign step with
+  "Error while loading the secret key file".
+- A workflow file that fails GitHub's push-time validation shows an
+  opaque 0-second failed run with zero jobs and no annotation. To get
+  the real error, `gh workflow run` a `workflow_dispatch` caller that
+  `uses:` it: the 422 carries the parser's message.
 
 ## After the first publish
 
