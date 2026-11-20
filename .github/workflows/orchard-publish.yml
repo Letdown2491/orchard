@@ -78,7 +78,6 @@ on:
       REGISTRY_PASSWORD:
         description: Registry password/token
         required: false
-        default: ""
 
 permissions:
   contents: write
