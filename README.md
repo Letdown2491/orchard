@@ -77,6 +77,20 @@ system-scope image install is broken; see DESIGN.md), so no polkit
 password appears. Updates after that first install come through
 Orchard's own catalog, not the command line.
 
+Verify the first copy before installing it: every release artifact
+wears a minisign signature whose public half is committed in this repo
+(`packaging/minisign.pub`), so the signature (the release) and the key
+(the repo, or a distro package) travel different channels:
+
+    curl -LO https://github.com/Letdown2491/orchard/releases/latest/download/orchard-linux-x86_64.oci.tgz.minisig
+    minisign -Vm orchard-linux-x86_64.oci.tgz -p packaging/minisign.pub
+
+`minisign` is in every distro's repos (`dnf install minisign`,
+`apt install minisign`, `apk add minisign`, `pacman -S minisign`). The
+catalog events pin the same digests from the publisher identity, so
+either channel alone catches a tampered archive; together they do not
+share a failure mode.
+
 ## Try it (Fedora atomic host, x86_64)
 
 The host has no toolchain; everything builds in a container via

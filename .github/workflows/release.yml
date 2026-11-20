@@ -16,6 +16,11 @@
 #                 key signs every apk release, on both architectures,
 #                 so users trust the shipped .pub once (unset on local
 #                 builds, which fall back to a throwaway key).
+#   MINISIGN_SECRET_KEY  the minisign secret key file (issue #8): every
+#                 release artifact wears a .minisig beside it, verified
+#                 against packaging/minisign.pub (committed). The key is
+#                 generated with -W (no password), so CI signs
+#                 unattended; same posture as APK_SIGN_PRIVATE_KEY.
 
 name: release
 
@@ -85,12 +90,34 @@ jobs:
           # header listing is the check).
           rpm -q --info target/generate-rpm/*.rpm || rpm2cpio target/generate-rpm/*.rpm | cpio -it | head
 
+      - name: Sign the packages (minisign, issue #8)
+        # The first-copy check: each package wears a minisign signature
+        # whose public half is committed at packaging/minisign.pub, so
+        # the signature (the release) and the key (the repo, the distro
+        # packages) travel different channels. -W: the CI key carries no
+        # password, so signing runs unattended. Fails loud on a missing
+        # key: an unsigned release is a regression, not a degenerate case.
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+        run: |
+          if [ -z "$MINISIGN_SECRET_KEY" ]; then
+            echo "MINISIGN_SECRET_KEY is unset: refusing to publish unsigned" >&2
+            exit 1
+          fi
+          sudo apt-get update && sudo apt-get install -y minisign
+          printf '%s\n' "$MINISIGN_SECRET_KEY" > /tmp/minisign.key
+          minisign -Sm target/debian/*.deb target/generate-rpm/*.rpm -s /tmp/minisign.key -W
+          rm -f /tmp/minisign.key
+
       - name: Attach the deb and rpm to the release
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           files: |
             target/debian/*.deb
+            target/debian/*.deb.minisig
             target/generate-rpm/*.rpm
+            target/generate-rpm/*.rpm.minisig
+            packaging/minisign.pub
           generate_release_notes: true
 
   apk:
@@ -120,12 +147,30 @@ jobs:
             alpine:3.22@sha256:49340b346798875b5592e5d420241f2f9cfba5f47e62ebb1446a1b34734e898f \
             sh packaging/build-apk.sh "${GITHUB_REF_NAME#v}"
 
+      - name: Sign the apk (minisign, issue #8)
+        # Same first-copy rule as the deb and rpm legs. The abuild key
+        # inside the apk is apk-tools' own chain; this is the release
+        # artifact's second-channel signature.
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+        run: |
+          if [ -z "$MINISIGN_SECRET_KEY" ]; then
+            echo "MINISIGN_SECRET_KEY is unset: refusing to publish unsigned" >&2
+            exit 1
+          fi
+          sudo apt-get update && sudo apt-get install -y minisign
+          printf '%s\n' "$MINISIGN_SECRET_KEY" > /tmp/minisign.key
+          minisign -Sm packaging/apk/out/*.apk -s /tmp/minisign.key -W
+          rm -f /tmp/minisign.key
+
       - name: Attach the apk and its public key to the release
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           files: |
             packaging/apk/out/*.apk
+            packaging/apk/out/*.apk.minisig
             packaging/apk/out/*.pub
+            packaging/minisign.pub
           generate_release_notes: true
 
   arch:
@@ -144,8 +189,24 @@ jobs:
             archlinux:base-devel@sha256:97119fd9e21219b02b3c14ba256c9d3c0d031d07fc26c836c41ed793beeb5b74 \
             sh packaging/build-pkg.sh "${GITHUB_REF_NAME#v}"
 
+      - name: Sign the pkg (minisign, issue #8)
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+        run: |
+          if [ -z "$MINISIGN_SECRET_KEY" ]; then
+            echo "MINISIGN_SECRET_KEY is unset: refusing to publish unsigned" >&2
+            exit 1
+          fi
+          sudo apt-get update && sudo apt-get install -y minisign
+          printf '%s\n' "$MINISIGN_SECRET_KEY" > /tmp/minisign.key
+          minisign -Sm packaging/arch/out/*.pkg.tar.zst -s /tmp/minisign.key -W
+          rm -f /tmp/minisign.key
+
       - name: Attach the pkg to the release
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
-          files: packaging/arch/out/*.pkg.tar.zst
+          files: |
+            packaging/arch/out/*.pkg.tar.zst
+            packaging/arch/out/*.pkg.tar.zst.minisig
+            packaging/minisign.pub
           generate_release_notes: true

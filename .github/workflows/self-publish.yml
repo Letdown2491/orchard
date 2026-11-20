@@ -8,8 +8,12 @@
 # exports unsigned asset metadata. The final job signs one release referencing
 # both assets, so architecture jobs cannot overwrite each other's release.
 #
-# Required repository secret:
+# Required repository secrets:
 #   ORCHARD_NSEC  the publisher identity's secret key (nsec hex)
+#   MINISIGN_SECRET_KEY  the minisign secret key file (issue #8): the
+#                 release's oci-archives wear .minisig signatures,
+#                 verified against packaging/minisign.pub (committed);
+#                 generated with -W (no password) so CI signs unattended
 # The relay list is publishing policy, versioned in
 # self/orchard.publish.toml, never a secret. GITHUB_TOKEN is both the
 # registry password and the repository-proof credential (it refreshes
@@ -90,6 +94,31 @@ jobs:
           gh release create "$GITHUB_REF_NAME" --generate-notes || true
           gh release upload "$GITHUB_REF_NAME" \
             "orchard-${{ matrix.arch }}.oci.tgz" --clobber
+
+      - name: Sign the artifact (minisign, issue #8)
+        # The bootstrap path's first-copy check: the archive wears a
+        # minisign signature whose public half is committed at
+        # packaging/minisign.pub, so the signature (this release) and
+        # the key (the repo, the distro packages) travel different
+        # channels. The same digests are pinned by the Nostr events the
+        # publish job signs from the publisher identity; two channels,
+        # one pin. -W: the CI key carries no password. Fails loud on a
+        # missing key: an unsigned release is a regression.
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ -z "$MINISIGN_SECRET_KEY" ]; then
+            echo "MINISIGN_SECRET_KEY is unset: refusing to publish unsigned" >&2
+            exit 1
+          fi
+          sudo apt-get update && sudo apt-get install -y minisign
+          printf '%s\n' "$MINISIGN_SECRET_KEY" > /tmp/minisign.key
+          minisign -Sm "orchard-${{ matrix.arch }}.oci.tgz" -s /tmp/minisign.key -W
+          rm -f /tmp/minisign.key
+          gh release upload "$GITHUB_REF_NAME" \
+            "orchard-${{ matrix.arch }}.oci.tgz.minisig" \
+            packaging/minisign.pub --clobber
 
   publish:
     needs: prepare
