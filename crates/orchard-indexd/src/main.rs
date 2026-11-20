@@ -15,11 +15,10 @@ use std::sync::Arc;
 
 use anyhow::Context as _;
 use orchard_core::CatalogFile;
-use orchard_indexd::ServerState;
 
-fn load_catalog() -> anyhow::Result<CatalogFile> {
+fn load_catalog(path_arg: Option<String>) -> anyhow::Result<CatalogFile> {
     let mut candidates: Vec<std::path::PathBuf> = Vec::new();
-    if let Some(arg) = std::env::args().nth(1) {
+    if let Some(arg) = path_arg {
         candidates.push(arg.into());
     }
     candidates.push("demo/catalog.json".into());
@@ -57,23 +56,61 @@ fn settings_handle() -> orchard_core::SettingsHandle {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let addr = std::env::var("ORCHARD_INDEXD_ADDR")
-        .unwrap_or_else(|_| "127.0.0.1:7780".to_string())
-        .parse()?;
+    // flags beat environment beats defaults (the same precedence the
+    // client uses). --listen and --relays restate the env vars for
+    // operators whose supervisors only pass flags; --public-url is
+    // hosted-only: the externally-visible base URL (the reverse
+    // proxy's https:// host) that /index/static names as Registry.
+    let mut listen: Option<String> = None;
+    let mut relays: Option<String> = None;
+    let mut public_url: Option<String> = None;
+    let mut catalog_path: Option<String> = None;
+    let mut args = std::env::args().skip(1).peekable();
+    while let Some(arg) = args.next() {
+        if !arg.starts_with("--") {
+            // the catalog path may sit before or after the flags
+            catalog_path = Some(arg);
+            continue;
+        }
+        let Some(value) = args.next() else {
+            anyhow::bail!("flag {arg} wants a value; usage: orchard-indexd [--listen HOST:PORT] [--relays URLS] [--public-url URL] [catalog.json]")
+        };
+        match arg.as_str() {
+            "--listen" => listen = Some(value),
+            "--relays" => relays = Some(value),
+            "--public-url" => public_url = Some(value),
+            other => anyhow::bail!("unknown flag {other}; usage: orchard-indexd [--listen HOST:PORT] [--relays URLS] [--public-url URL] [catalog.json]"),
+        }
+    }
 
-    let catalog = load_catalog()?;
+    let addr: std::net::SocketAddr = listen
+        .or_else(|| std::env::var("ORCHARD_INDEXD_ADDR").ok())
+        .unwrap_or_else(|| "127.0.0.1:7780".to_string())
+        .parse()?;
+    if let Some(relays) = &relays {
+        // Sound here and only here: main is still single-threaded, no
+        // other thread has read or cached the environment (the relay
+        // supervisor and the crawlers all start inside serve()).
+        // SAFETY: see above.
+        unsafe { std::env::set_var("ORCHARD_RELAYS", relays) };
+    }
+    if public_url.is_none() {
+        public_url = std::env::var("ORCHARD_PUBLIC_URL").ok();
+    }
+
+    let catalog = load_catalog(catalog_path)?;
     let settings = settings_handle();
     let sets = orchard_indexd::relay_sets(&settings);
     if !sets.events.is_empty() {
         println!("subscribing to relays: {}", sets.events.join(", "));
     }
 
-    let state = ServerState {
+    let state = orchard_indexd::ServerState {
         document: Arc::new(catalog),
         relays_reset: None,
         relays_health: None,
-    };
-    let cache = std::env::var_os("XDG_DATA_HOME")
+        public_url,
+    };    let cache = std::env::var_os("XDG_DATA_HOME")
         .map(std::path::PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| {
             std::path::PathBuf::from(home).join(".local/share")
