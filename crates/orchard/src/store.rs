@@ -2724,8 +2724,11 @@ impl StoreRoot {
                 String::new()
             } else {
                 match (&report, &download_source) {
-                (Ok(report), source) if app.oci_assets.is_some()
-                    || matches!(source, oci::Location::Registry { .. } | oci::Location::ManifestUrl(_)) => {
+                // the remote path short-circuits above, so registry
+                // and manifest-url rows never reach this match: a row
+                // here installs from assets (already downloaded into a
+                // layout) or from a local path or bundle
+                (Ok(report), _) if app.oci_assets.is_some() => {
                     let dir = crate::cache::artifact_dir(&app.app_id, &report.digest);
                     if dir.is_dir() {
                         format!("oci:{}", dir.display())
@@ -2763,7 +2766,11 @@ impl StoreRoot {
                 // verify failed: the update below reports it and never
                 // reaches an install
                 (Err(_), _) => String::new(),
-                (Ok(_), oci::Location::Registry { .. } | oci::Location::ManifestUrl(_)) => {
+                // unreachable while the remote path short-circuits
+                // above (registry and manifest-url rows are remote
+                // installs); kept as the fail-loud net if a registry
+                // row ever arrives here without its pin
+                (Ok(_), _) => {
                     let _ = this.update(cx, |this, cx| {
                         this.jobs.remove(&app.app_id);
                         this.fail(format!("could not select an OCI install path for {}", app.name));
@@ -9521,7 +9528,8 @@ fn merge_reviewed_channels(
 /// The shared HTTP client for catalog-side reads: one agent keeps its
 /// connection pool and TLS setup alive across the 30s polls instead of
 /// paying both per call and dropping the keep-alive each time.
-fn http_agent() -> ureq::Agent {    static AGENT: std::sync::OnceLock<ureq::Agent> = std::sync::OnceLock::new();
+fn http_agent() -> ureq::Agent {
+    static AGENT: std::sync::OnceLock<ureq::Agent> = std::sync::OnceLock::new();
     AGENT
         .get_or_init(|| {
             ureq::AgentBuilder::new()

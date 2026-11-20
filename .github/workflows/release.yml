@@ -105,9 +105,13 @@ jobs:
             exit 1
           fi
           sudo apt-get update && sudo apt-get install -y minisign
-          printf '%s\n' "$MINISIGN_SECRET_KEY" > /tmp/minisign.key
-          minisign -Sm target/debian/*.deb target/generate-rpm/*.rpm -s /tmp/minisign.key -W
-          rm -f /tmp/minisign.key
+          # the key file is unencrypted (-W): owner-only permissions and
+          # a trap-verified removal, so a signing failure cannot leave
+          # it behind on the runner
+          umask 077
+          trap 'rm -f "$RUNNER_TEMP/minisign.key"' EXIT
+          printf '%s\n' "$MINISIGN_SECRET_KEY" > "$RUNNER_TEMP/minisign.key"
+          minisign -Sm target/debian/*.deb target/generate-rpm/*.rpm -s "$RUNNER_TEMP/minisign.key" -W
 
       - name: Attach the deb and rpm to the release
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
@@ -159,9 +163,13 @@ jobs:
             exit 1
           fi
           sudo apt-get update && sudo apt-get install -y minisign
-          printf '%s\n' "$MINISIGN_SECRET_KEY" > /tmp/minisign.key
-          minisign -Sm packaging/apk/out/*.apk -s /tmp/minisign.key -W
-          rm -f /tmp/minisign.key
+          # the key file is unencrypted (-W): owner-only permissions and
+          # a trap-verified removal, so a signing failure cannot leave
+          # it behind on the runner
+          umask 077
+          trap 'rm -f "$RUNNER_TEMP/minisign.key"' EXIT
+          printf '%s\n' "$MINISIGN_SECRET_KEY" > "$RUNNER_TEMP/minisign.key"
+          minisign -Sm packaging/apk/out/*.apk -s "$RUNNER_TEMP/minisign.key" -W
 
       - name: Attach the apk and its public key to the release
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
@@ -198,9 +206,13 @@ jobs:
             exit 1
           fi
           sudo apt-get update && sudo apt-get install -y minisign
-          printf '%s\n' "$MINISIGN_SECRET_KEY" > /tmp/minisign.key
-          minisign -Sm packaging/arch/out/*.pkg.tar.zst -s /tmp/minisign.key -W
-          rm -f /tmp/minisign.key
+          # the key file is unencrypted (-W): owner-only permissions and
+          # a trap-verified removal, so a signing failure cannot leave
+          # it behind on the runner
+          umask 077
+          trap 'rm -f "$RUNNER_TEMP/minisign.key"' EXIT
+          printf '%s\n' "$MINISIGN_SECRET_KEY" > "$RUNNER_TEMP/minisign.key"
+          minisign -Sm packaging/arch/out/*.pkg.tar.zst -s "$RUNNER_TEMP/minisign.key" -W
 
       - name: Attach the pkg to the release
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2

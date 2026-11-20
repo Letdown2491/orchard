@@ -39,17 +39,13 @@ fn start_indexd(catalog: orchard_core::CatalogFile, settings: orchard_core::Sett
                     return;
                 }
             };
-            let state = orchard_indexd::ServerState {
-                document: std::sync::Arc::new(catalog),
-                relays_reset: None,
-                relays_health: None,
-                public_url: None,
-            };
             let cache = crate::cache::events_cache_path();
             // the settings handle stays live: relay edits in the
             // client's settings page reach the relay session and the
             // crawlers within a second, no restart
-            if let Err(err) = runtime.block_on(orchard_indexd::serve(addr, state, settings, cache)) {
+            if let Err(err) =
+                runtime.block_on(orchard_indexd::serve(addr, std::sync::Arc::new(catalog), None, settings, cache))
+            {
                 eprintln!("indexd failed: {err:#}");
             }
         })
@@ -65,7 +61,7 @@ fn start_indexd(catalog: orchard_core::CatalogFile, settings: orchard_core::Sett
     }
 
     // Issue #7, the bulk seam: register the shim as a real flatpak
-    // remote (`flatpak remote-add --if-not-exists --oci --user orchard
+    // remote (`flatpak remote-add --if-not-exists --user orchard
     // oci+http://...`). Idempotent, best-effort, off the startup path:
     // a failure leaves the client working as before (installs through
     // its own plumbing) while `flatpak install orchard/...` and GNOME

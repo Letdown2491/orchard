@@ -88,10 +88,11 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or_else(|| "127.0.0.1:7780".to_string())
         .parse()?;
     if let Some(relays) = &relays {
-        // Sound here and only here: main is still single-threaded, no
-        // other thread has read or cached the environment (the relay
-        // supervisor and the crawlers all start inside serve()).
-        // SAFETY: see above.
+        // resolve_set reads ORCHARD_RELAYS ahead of the settings file,
+        // so the flag lands in the environment. Rust marks set_var
+        // unsafe because a concurrent reader is UB; none is possible
+        // here: the relay supervisor and the crawlers that could read
+        // it all start inside serve(), below, which runs after this.
         unsafe { std::env::set_var("ORCHARD_RELAYS", relays) };
     }
     if public_url.is_none() {
@@ -105,12 +106,7 @@ async fn main() -> anyhow::Result<()> {
         println!("subscribing to relays: {}", sets.events.join(", "));
     }
 
-    let state = orchard_indexd::ServerState {
-        document: Arc::new(catalog),
-        relays_reset: None,
-        relays_health: None,
-        public_url,
-    };    let cache = std::env::var_os("XDG_DATA_HOME")
+    let cache = std::env::var_os("XDG_DATA_HOME")
         .map(std::path::PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| {
             std::path::PathBuf::from(home).join(".local/share")
@@ -118,5 +114,5 @@ async fn main() -> anyhow::Result<()> {
         .map(|data| data.join("orchard/nostr-events.json"));
 
     println!("orchard-indexd serving on http://{addr}");
-    orchard_indexd::serve(addr, state, settings, cache).await
+    orchard_indexd::serve(addr, Arc::new(catalog), public_url, settings, cache).await
 }
