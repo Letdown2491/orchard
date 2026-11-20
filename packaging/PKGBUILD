@@ -18,7 +18,13 @@ pkgdesc="The permissionless Flatpak store: publishers sign, the catalog is a Nos
 url="https://github.com/Letdown2491/orchard"
 arch=('x86_64' 'aarch64')
 license=('MIT')
-depends=('fontconfig' 'freetype' 'libxkbcommon' 'libxkbcommon-x11' 'wayland'
+# !lto: makepkg's `lto` option appends -flto=auto to CFLAGS, and ring
+# 0.17's perlasm/C objects then enter libring_core as LTO bitcode that
+# the final link cannot resolve (undefined ring_core_<ver>__* symbols;
+# the same failure the gmpublisher Arch packaging hit, fixed the same
+# way). The distro's own ring package does not build through makepkg.
+options=(!lto)
+depends=('fontconfig' 'freetype2' 'libxkbcommon' 'libxkbcommon-x11' 'wayland'
          'libxcb' 'vulkan-icd-loader')
 # Arch rolling carries a current rustc: edition 2024 needs 1.85, no
 # rustup dance required (unlike alpine 3.22's system cargo).
@@ -32,15 +38,21 @@ sha256sums=('SKIP')
 builddir="$srcdir/$pkgname-$pkgver"
 
 build() {
+    # makepkg runs build() in $srcdir: the GitHub tarball's payload is
+    # one level down (orchard-<ver>/); abuild does this via builddir,
+    # makepkg does not.
+    cd "$srcdir/$pkgname-$pkgver"
     cargo build --release --locked -p orchard
 }
 
 check() {
+    cd "$srcdir/$pkgname-$pkgver"
     # The domain layer's suite: no display, no sockets, minutes-fast.
     cargo test --locked -p orchard-core
 }
 
 package() {
+    cd "$srcdir/$pkgname-$pkgver"
     install -Dm755 target/release/orchard \
         "$pkgdir"/usr/bin/orchard
     install -Dm644 packaging/rocks.orchard.Orchard.desktop \
