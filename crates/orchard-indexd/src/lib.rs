@@ -931,13 +931,15 @@ async fn v2_proxy(
                 };
                 match agent.get(&url).set("Authorization", &token).call() {
                     Ok(response) => response,
-                    Err(_) => {
+                    Err(err) => {
+                        eprintln!("v2 proxy: post-token fetch failed: {err:#}");
                         let _ = head_tx.send(Err(axum::http::StatusCode::BAD_GATEWAY));
                         return;
                     }
                 }
             }
-            Err(_) => {
+            Err(err) => {
+                eprintln!("v2 proxy: fetch failed: {err:#}");
                 let _ = head_tx.send(Err(axum::http::StatusCode::BAD_GATEWAY));
                 return;
             }
