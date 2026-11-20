@@ -71,6 +71,7 @@ async fn main() -> anyhow::Result<()> {
     let state = ServerState {
         document: Arc::new(catalog),
         relays_reset: None,
+        relays_health: None,
     };
     let cache = std::env::var_os("XDG_DATA_HOME")
         .map(std::path::PathBuf::from)

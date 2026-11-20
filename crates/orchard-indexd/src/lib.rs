@@ -199,6 +199,10 @@ pub struct ServerState {
     /// each re-subscribes and re-delivers its events into the emptied
     /// feed. None for a static document (no relays to nudge).
     pub relays_reset: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// Per-relay health, written by the relay threads and served by
+    /// /v1/relays (issue #12: silent relay failures become visible
+    /// ones). None for a static document.
+    pub relays_health: Option<orchard_nostr::relay::RelayHealthMap>,
 }
 
 /// Relay and cache configuration for [`serve`].
@@ -449,11 +453,16 @@ fn guarded<F: FnOnce()>(name: &str, body: F) {
 /// stop (its read wakes on a timeout) and a new relay's thread starts
 /// on the next pass. The feed deduplicates, so nothing is re-read
 /// that a kept relay already delivered.
+///
+/// Returns the per-URL health map: each relay thread stamps its
+/// entry, the /v1/relays endpoint serves it (issue #12).
 fn spawn_relay_supervisor(
     settings: orchard_core::SettingsHandle,
     feed: Arc<Mutex<orchard_nostr::Feed>>,
     reset: Arc<std::sync::atomic::AtomicBool>,
-) {
+) -> orchard_nostr::relay::RelayHealthMap {
+    let health: orchard_nostr::relay::RelayHealthMap = Default::default();
+    let health_threads = Arc::clone(&health);
     std::thread::Builder::new()
         .name("orchard-relays".into())
         .spawn(move || {
@@ -484,6 +493,11 @@ fn spawn_relay_supervisor(
                         true
                     } else {
                         stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                        // the thread is gone; its health row goes with
+                        // it, so the endpoint never serves a dead URL
+                        health_threads.lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .remove(url);
                         false
                     }
                 });
@@ -495,6 +509,12 @@ fn spawn_relay_supervisor(
                     let relay_url = url.clone();
                     let feed = Arc::clone(&feed);
                     let thread_stop = Arc::clone(&stop);
+                    let relay_health = health_threads
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .entry(url.clone())
+                        .or_default()
+                        .clone();
                     let spawned = std::thread::Builder::new()
                         .name(format!("relay-{relay_url}"))
                         .spawn(move || {
@@ -503,6 +523,7 @@ fn spawn_relay_supervisor(
                                 feed,
                                 Arc::new(|| {}),
                                 thread_stop,
+                                relay_health,
                             )
                         });
                     match spawned {
@@ -517,6 +538,7 @@ fn spawn_relay_supervisor(
             }
         })
         .expect("spawning the relay supervisor");
+    health
 }
 
 /// Build the axum router for a state.
@@ -528,6 +550,7 @@ pub fn router(state: ServerState) -> Router {
         .route("/v1/reviews", get(reviews))
         .route("/v1/profiles", get(profiles))
         .route("/v1/graph", get(graph))
+        .route("/v1/relays", get(relays))
         .route("/v1/cache", post(clear_cache))
         .with_state(state)
 }
@@ -536,7 +559,7 @@ async fn root() -> Json<serde_json::Value> {
     Json(serde_json::json!({
         "service": "orchard-indexd",
         "description": "Orchard's local catalog service",
-        "endpoints": ["/v1/catalog", "/v1/reviews", "/v1/profiles", "/v1/graph", "/index/{arch}"]
+        "endpoints": ["/v1/catalog", "/v1/reviews", "/v1/profiles", "/v1/graph", "/v1/relays", "/index/{arch}"]
     }))
 }
 
@@ -587,6 +610,41 @@ async fn graph(State(state): State<ServerState>) -> Json<orchard_core::GraphFile
     Json(state.document.graph())
 }
 
+/// Per-relay health (issue #12): what the relay threads stamp. The
+/// frame age is computed here, at read time, so the client needs no
+/// clock of its own and a poll every few seconds is the whole story.
+/// Rows appear and disappear with the supervisor's relay set.
+async fn relays(State(state): State<ServerState>) -> Json<serde_json::Value> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_millis() as u64)
+        .unwrap_or(0);
+    let rows: Vec<serde_json::Value> = match &state.relays_health {
+        Some(map) => map
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .map(|(url, health)| {
+                let health = health
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                serde_json::json!({
+                    "url": url,
+                    "connected": health.connected,
+                    "last_frame_at": health.last_frame_at,
+                    "last_frame_age_secs": health
+                        .last_frame_at
+                        .map(|at| now.saturating_sub(at) / 1000),
+                    "last_error": health.last_error,
+                    "failures": health.failures,
+                })
+            })
+            .collect(),
+        None => vec![],
+    };
+    Json(serde_json::json!({ "relays": rows }))
+}
+
 /// Clear absorbed events: the feed refills from the relays on their
 /// next pass, and the disk cache empties on the writer's next tick.
 async fn clear_cache(State(state): State<ServerState>) -> &'static str {
@@ -618,7 +676,8 @@ pub async fn serve(
     // the supervisor cycles the relay threads, whose fresh connections
     // re-subscribe and re-deliver
     let relays_reset = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    spawn_relay_supervisor(settings.clone(), Arc::clone(&feed), Arc::clone(&relays_reset));
+    let relays_health =
+        spawn_relay_supervisor(settings.clone(), Arc::clone(&feed), Arc::clone(&relays_reset));
     spawn_cache_writer(cache, Arc::clone(&feed));
     let graph = Arc::new(Mutex::new(GraphStore::default()));
     spawn_graph_crawler(settings.clone(), Arc::clone(&feed), Arc::clone(&graph));
@@ -630,6 +689,7 @@ pub async fn serve(
             graph,
         }),
         relays_reset: Some(relays_reset),
+        relays_health: Some(relays_health),
     };
     // A restart races the previous instance's dying listener for the
     // port, and losing that race used to cost the whole session: the
@@ -871,6 +931,7 @@ mod tests {
         let router = router(ServerState {
             document: Arc::new(catalog.clone()),
             relays_reset: None,
+            relays_health: None,
         });
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -912,6 +973,94 @@ mod tests {
             .into_json()
             .unwrap();
         assert!(profiles.profiles.is_empty());
+
+        server.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn relays_endpoint_serves_health() {
+        let router = router(ServerState {
+            document: Arc::new(sample_catalog()),
+            relays_reset: None,
+            relays_health: None,
+        });
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+
+        let agent = ureq::AgentBuilder::new().build();
+
+        // a static document carries no relays: the endpoint exists and
+        // serves an empty list rather than a 404 (same rule as profiles)
+        let body: serde_json::Value = agent
+            .get(&format!("http://{addr}/v1/relays"))
+            .call()
+            .unwrap()
+            .into_json()
+            .unwrap();
+        assert_eq!(body["relays"].as_array().map(Vec::len), Some(0));
+
+        server.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn relays_endpoint_serves_stamped_rows() {
+        use orchard_nostr::relay::{RelayHealth, SharedRelayHealth};
+        let map: orchard_nostr::relay::RelayHealthMap = Default::default();
+        let live: SharedRelayHealth = Default::default();
+        *live.lock().unwrap() = RelayHealth {
+            connected: true,
+            last_frame_at: Some(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis() as u64
+                    - 5_000,
+            ),
+            last_error: None,
+            failures: 0,
+        };
+        let down: SharedRelayHealth = Default::default();
+        *down.lock().unwrap() = RelayHealth {
+            connected: false,
+            last_frame_at: None,
+            last_error: Some("connection refused".into()),
+            failures: 3,
+        };
+        map.lock().unwrap().insert("ws://live".into(), live);
+        map.lock().unwrap().insert("ws://down".into(), down);
+
+        let router = router(ServerState {
+            document: Arc::new(sample_catalog()),
+            relays_reset: None,
+            relays_health: Some(map),
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+
+        let agent = ureq::AgentBuilder::new().build();
+        let body: serde_json::Value = agent
+            .get(&format!("http://{addr}/v1/relays"))
+            .call()
+            .unwrap()
+            .into_json()
+            .unwrap();
+        let rows = body["relays"].as_array().unwrap();
+        assert_eq!(rows.len(), 2);
+        let live = rows.iter().find(|r| r["url"] == "ws://live").unwrap();
+        assert_eq!(live["connected"], true);
+        // the age is computed at read time: ~5s, not 0, not the stamp
+        assert!(live["last_frame_age_secs"].as_u64().unwrap() < 30);
+        let down = rows.iter().find(|r| r["url"] == "ws://down").unwrap();
+        assert_eq!(down["connected"], false);
+        assert_eq!(down["failures"], 3);
+        assert_eq!(down["last_error"], "connection refused");
 
         server.abort();
     }

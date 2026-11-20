@@ -380,6 +380,11 @@ pub struct StoreRoot {
     /// Last painted text layouts for the two relay inputs (events,
     /// social): the caret queries last frame's measured layout.
     relay_layouts: [Option<TextLayout>; 2],
+    /// Per-relay health from indexd's /v1/relays (issue #12): keyed by
+    /// URL, refreshed on the 30s poll. A missing entry means the relay
+    /// is untracked (the social set is one-shot crawls) or the first
+    /// poll has not landed yet.
+    relay_health: std::collections::BTreeMap<String, RelayStatus>,
     /// The settings page's vertical scroll.
     settings_scroll: gpui::ScrollHandle,
     /// The signed-in reviewer: a NIP-46 session (the remote signer's
@@ -518,6 +523,7 @@ impl StoreRoot {
             relay_cursor: 0,
             relay_anchor: None,
             relay_layouts: [None, None],
+            relay_health: Default::default(),
             settings_scroll: ScrollHandle::new(),
             reviewer: load_reviewer(),
             signin_modal: false,
@@ -645,6 +651,26 @@ impl StoreRoot {
                     if this.reviewer.is_some() {
                         this.ensure_own_profile(cx);
                     }
+                });
+            }
+        })
+        .detach();
+
+        // Relay health: the same poll cadence as the catalog, one GET.
+        // This is issue #12: a relay that dies retries forever in the
+        // background, and without this poll nothing in the UI ever
+        // says so.
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_secs(30))
+                    .await;
+                let health = cx
+                    .background_executor()
+                    .spawn(async move { load_relay_health() })
+                    .await;
+                let _ = this.update(cx, |this, _cx| {
+                    this.relay_health = health;
                 });
             }
         })
@@ -6954,7 +6980,18 @@ impl Render for StoreRoot {
                             .child(match self.reviewed_loading {
                                 true => format!("{total} apps (loading catalog…) · {installed_count} installed"),
                                 false => format!("{total} apps · {installed_count} installed"),
-                            }),
+                            })
+                            // issue #12: when every tracked relay is
+                            // disconnected, the catalog below is going
+                            // stale and nothing else says so. An empty
+                            // map (no poll yet, or a file fallback)
+                            // stays silent rather than crying wolf.
+                            .children((!self.relay_health.is_empty()
+                                && self
+                                    .relay_health
+                                    .values()
+                                    .all(|status| !status.connected))
+                            .then(|| " · relays unreachable")),
                     )
                     .child(div().flex_1())
                     // the running job, right-aligned: stage, percent,
@@ -7972,6 +8009,7 @@ impl StoreRoot {
             })
         };
 
+        let health_map = self.relay_health.clone();
         let rows = div()
             .flex()
             .flex_col()
@@ -8006,7 +8044,17 @@ impl StoreRoot {
                             } else {
                                 showing_defaults
                                     .then(|| ui::badge("built-in", ui::text_dim()).into_any_element())
-                            }),
+                            })
+                            // the health badge (issue #12): only for
+                            // relays the daemon tracks, so the social
+                            // set (one-shot crawls, no session) and a
+                            // pending first poll render nothing
+                            .children(
+                                health_map
+                                    .get(url.as_str())
+                                    .map(|status| relay_status_badge(status))
+                                    .map(|badge| badge.into_any_element()),
+                            ),
                     )
                     .children((url.as_str() != orchard_nostr::relay::REQUIRED_RELAY).then(|| {
                         ui::small_button(
@@ -9382,8 +9430,7 @@ fn merge_reviewed_channels(
 /// The shared HTTP client for catalog-side reads: one agent keeps its
 /// connection pool and TLS setup alive across the 30s polls instead of
 /// paying both per call and dropping the keep-alive each time.
-fn http_agent() -> ureq::Agent {
-    static AGENT: std::sync::OnceLock<ureq::Agent> = std::sync::OnceLock::new();
+fn http_agent() -> ureq::Agent {    static AGENT: std::sync::OnceLock<ureq::Agent> = std::sync::OnceLock::new();
     AGENT
         .get_or_init(|| {
             ureq::AgentBuilder::new()
@@ -9424,6 +9471,79 @@ fn fetch_profile_raws() -> anyhow::Result<std::collections::BTreeMap<String, Str
         .call()?
         .into_json()?;
     Ok(file.profiles)
+}
+
+/// One relay row's status badge (issue #12): live in the accent ink,
+/// trouble in the warn ink. The age text is minutes, coarse on
+/// purpose: the poll is 30s and a healthy catalog relay streams
+/// constantly, so a minute-scale age is already news.
+fn relay_status_badge(status: &RelayStatus) -> gpui::Div {
+    if status.connected {
+        match status.last_frame_age_secs {
+            Some(age) if age >= 300 => {
+                ui::badge(format!("quiet {}m", age / 60).as_str(), ui::warn())
+            }
+            _ => ui::badge("live", ui::accent()),
+        }
+    } else if status.failures > 0 {
+        ui::badge("down, retrying", ui::warn())
+    } else {
+        // the supervisor spawned the thread but the first session has
+        // not stamped anything yet
+        ui::badge("starting", ui::text_dim())
+    }
+}
+
+/// One relay row's health, from indexd's /v1/relays. The age comes
+/// computed from the server so the client keeps no clock.
+#[derive(Clone, Debug)]
+struct RelayStatus {
+    connected: bool,
+    last_frame_age_secs: Option<u64>,
+    last_error: Option<String>,
+    failures: u32,
+}
+
+/// Per-relay health from the local indexd (issue #12). An error (the
+/// daemon not up, the endpoint missing) leaves the map empty and the
+/// UI shows no badges: the poll simply retries.
+fn load_relay_health() -> std::collections::BTreeMap<String, RelayStatus> {
+    let agent = http_agent();
+    let response = agent
+        .get(&format!("http://127.0.0.1:{INDEXD_PORT}/v1/relays"))
+        .call();
+    let Ok(response) = response else {
+        return Default::default();
+    };
+    let parsed: Option<serde_json::Value> = response.into_json().ok();
+    let Some(serde_json::Value::Object(payload)) = parsed else {
+        return Default::default();
+    };
+    payload
+        .get("relays")
+        .and_then(|rows| rows.as_array())
+        .map(|rows| {
+            rows.iter()
+                .filter_map(|row| {
+                    let url = row.get("url")?.as_str()?.to_string();
+                    Some((
+                        url,
+                        RelayStatus {
+                            connected: row.get("connected")?.as_bool()?,
+                            last_frame_age_secs: row
+                                .get("last_frame_age_secs")
+                                .and_then(|age| age.as_u64()),
+                            last_error: row
+                                .get("last_error")
+                                .and_then(|err| err.as_str())
+                                .map(|err| err.to_string()),
+                            failures: row.get("failures")?.as_u64()? as u32,
+                        },
+                    ))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Merge a new display name into the author's existing kind 0

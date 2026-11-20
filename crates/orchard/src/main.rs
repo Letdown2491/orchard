@@ -42,6 +42,7 @@ fn start_indexd(catalog: orchard_core::CatalogFile, settings: orchard_core::Sett
             let state = orchard_indexd::ServerState {
                 document: std::sync::Arc::new(catalog),
                 relays_reset: None,
+                relays_health: None,
             };
             let cache = crate::cache::events_cache_path();
             // the settings handle stays live: relay edits in the

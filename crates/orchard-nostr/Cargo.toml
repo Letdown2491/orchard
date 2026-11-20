@@ -10,6 +10,7 @@ publish = false
 anyhow = { workspace = true }
 nostr = { workspace = true }
 orchard-core = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
 # sync WebSocket client for NIP-01 relay subscriptions; rustls so no OpenSSL
 tungstenite = { version = "0.30", default-features = false, features = ["handshake", "rustls-tls-webpki-roots"] }
