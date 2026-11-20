@@ -1,0 +1,192 @@
+# The publish path as a reusable workflow (issue #9): what
+# self-publish.yml does for Orchard itself, consumed with `uses:` by
+# any app repo. Manifest in, release out: the caller's publish manifest
+# and app tree become an OCI artifact on the registry, a release
+# carrying the oci-archive (plus its minisign signature when the
+# MINISIGN_SECRET_KEY secret exists), and the NIP-82 events pinning the
+# digests on the manifest's relays.
+#
+# orchard-publish is built from source at a pinned Orchard ref (pure
+# Rust, no native stack, a bare runner suffices). Pin the ref in the
+# caller: the workflow is only as trustworthy as that pin.
+#
+# Caller shape (see PUBLISHING.md):
+#
+#   jobs:
+#     publish:
+#       uses: Letdown2491/orchard/.github/workflows/orchard-publish.yml@v0.5.0
+#       with:
+#         manifest-path: app.publish.toml
+#         matrix: '{"include":[{"arch":"linux-x86_64","runner":"ubuntu-latest"}]}'
+#         registry: ghcr.io/owner/app
+#       secrets:
+#         ORCHARD_NSEC: ${{ secrets.ORCHARD_NSEC }}
+
+name: orchard-publish
+
+on:
+  workflow_call:
+    inputs:
+      manifest-path:
+        description: Publish manifest path, relative to the caller's repo root
+        type: string
+        required: true
+      matrix:
+        description: GitHub matrix as JSON, e.g. {"include":[{"arch":"linux-x86_64","runner":"ubuntu-latest"}]}; arch names are the manifest platform tags
+        type: string
+        required: true
+      version:
+        description: Unused placeholder; the manifest's [release].version is the truth
+        type: string
+        required: false
+        default: ""
+      registry:
+        description: Registry repo base (e.g. ghcr.io/owner/app); overrides the manifest
+        type: string
+        required: false
+        default: ""
+      relays:
+        description: Comma-separated relay URLs; overrides the manifest's relay list
+        type: string
+        required: false
+        default: ""
+      orchard-repository:
+        description: The Orchard repo orchard-publish builds from
+        type: string
+        required: false
+        default: Letdown2491/orchard
+      orchard-ref:
+        description: The Orchard ref to build from; pin it in the caller
+        type: string
+        required: false
+        default: main
+      create-release:
+        description: Attach the oci-archive to a release named after the tag
+        type: boolean
+        required: false
+        default: true
+    secrets:
+      ORCHARD_NSEC:
+        description: The publisher identity's secret key (nsec hex)
+        required: true
+      MINISIGN_SECRET_KEY:
+        description: Optional minisign key (issue #8): the release's oci-archive wears a .minisig
+        required: false
+        default: ""
+      REGISTRY_USER:
+        description: Registry login; ghcr needs ${{ github.actor }}; GITHUB_TOKEN works
+        required: false
+        default: ""
+      REGISTRY_PASSWORD:
+        description: Registry password/token
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  prepare:
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(inputs.matrix) }}
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the Rust toolchain
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch head
+
+      - name: Build orchard-publish (pinned Orchard ref)
+        run: |
+          cargo install --locked --git \
+            "https://github.com/${{ inputs.orchard-repository }}" \
+            --rev "${{ inputs.orchard-ref }}" orchard-publish
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Push artifact and export metadata
+        env:
+          ORCHARD_REGISTRY_USER: ${{ secrets.REGISTRY_USER || github.actor }}
+          ORCHARD_REGISTRY_PASSWORD: ${{ secrets.REGISTRY_PASSWORD || github.token }}
+        run: |
+          args=""
+          [ -n "${{ inputs.registry }}" ] && args="$args --registry ${{ inputs.registry }}"
+          orchard-publish "${{ inputs.manifest-path }}" \
+            --upload-only --arch "${{ matrix.arch }}" --out dist $args
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: asset-${{ matrix.arch }}
+          path: dist/*.asset.json
+          if-no-files-found: error
+
+      - name: Attach the artifact to the release
+        if: inputs.create-release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # The release carries the artifact itself, as an oci-archive
+          # the README's two-liner installs with flatpak's local path
+          # (a digest-pinned docker:// one-liner cannot work: flatpak's
+          # image fetch never authenticates, token registries always
+          # challenge).
+          asset="dist/asset-${{ matrix.arch }}"
+          tgz="$(ls dist/*.oci.tgz | head -1)"
+          gh release create "$GITHUB_REF_NAME" --generate-notes -R "$GITHUB_REPOSITORY" || true
+          gh release upload "$GITHUB_REF_NAME" "$tgz" -R "$GITHUB_REPOSITORY" --clobber
+
+      - name: Sign the artifact (minisign)
+        # Optional: when the caller carries a MINISIGN_SECRET_KEY
+        # secret, the release's oci-archive wears a .minisig (issue #8's
+        # first-copy rule). Callers without a key skip this; the Nostr
+        # events still pin the digests.
+        if: inputs.create-release
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          [ -n "$MINISIGN_SECRET_KEY" ] || { echo "no MINISIGN_SECRET_KEY: skipping"; exit 0; }
+          sudo apt-get update && sudo apt-get install -y minisign
+          printf '%s\n' "$MINISIGN_SECRET_KEY" > /tmp/minisign.key
+          tgz="$(ls dist/*.oci.tgz | head -1)"
+          minisign -Sm "$tgz" -s /tmp/minisign.key -W
+          rm -f /tmp/minisign.key
+          gh release upload "$GITHUB_REF_NAME" "$tgz.minisig" -R "$GITHUB_REPOSITORY" --clobber
+
+  publish:
+    needs: prepare
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: asset-*
+          path: dist
+          merge-multiple: true
+
+      - name: Install the Rust toolchain
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch head
+
+      - name: Build orchard-publish (pinned Orchard ref)
+        run: |
+          cargo install --locked --git \
+            "https://github.com/${{ inputs.orchard-repository }}" \
+            --rev "${{ inputs.orchard-ref }}" orchard-publish
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Sign and prove the combined release
+        env:
+          ORCHARD_NSEC: ${{ secrets.ORCHARD_NSEC }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          # The NIP-82 events: the manifest's relays receive the
+          # publisher-signed events pinning every arch's digest, the
+          # proof Orchard's client checks on install. --legacy-oci
+          # names the registry manifest URL the client reads.
+          assets=$(find dist -name '*.asset.json' | sort | sed 's/^/--asset /' | tr '\n' ' ')
+          relays=""
+          [ -n "${{ inputs.relays }}" ] && relays="--relays ${{ inputs.relays }}"
+          orchard-publish "${{ inputs.manifest-path }}" \
+            $assets --legacy-oci --prove $relays

@@ -1,0 +1,8 @@
+[Desktop Entry]
+Name=My App
+Comment=Installed through Orchard
+Exec=my-app
+Terminal=false
+Type=Application
+Categories=Utility;
+Icon=com.example.MyApp

@@ -368,6 +368,45 @@ repository publication independently of these software assets.
 
 ## CI workflow
 
+### The action-first path (issue #9)
+
+The publish path is a reusable workflow: `uses:` it from your app repo
+and skip the plumbing below. `templates/example-app/` is the starting
+point (a template manifest, a minimal app tree, and the caller
+workflow); copy it, rename the app, set your registry and relays:
+
+```yaml
+# .github/workflows/publish.yml in your app repo
+name: publish
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  publish:
+    uses: Letdown2491/orchard/.github/workflows/orchard-publish.yml@v0.5.0
+    with:
+      manifest-path: app.publish.toml
+      matrix: '{"include":[{"arch":"linux-x86_64","runner":"ubuntu-latest"}]}'
+      registry: ghcr.io/owner/myapp
+      # Pin the Orchard ref the publisher builds from: bump deliberately.
+      orchard-ref: v0.5.0
+    secrets:
+      ORCHARD_NSEC: ${{ secrets.ORCHARD_NSEC }}
+```
+
+The workflow builds `orchard-publish` from the pinned ref (pure Rust,
+a bare runner), pushes the artifact, attaches the oci-archive to the
+release (with a minisign signature when you add a MINISIGN_SECRET_KEY
+secret), and signs the NIP-82 events to the manifest's relays. One
+shape rule: a `uses:` job cannot carry `run:` steps, so the app tree
+must be committed (a script or static app) or assembled by an earlier
+job that `needs:` this one, with the tree handed over as an artifact.
+The afternoon target: copy `templates/example-app/`, set two fields,
+push a tag.
+
+### The self-hosted shape
+
 `.github/workflows/self-publish.yml` is a working example (Orchard
 publishing itself). The shape to copy, replacing the manifest, assembly script
 and `com.example.App` with your application's paths and ID:

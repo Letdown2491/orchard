@@ -1,0 +1,4 @@
+#!/bin/sh
+# Replace this with your built binary; everything under files/ ships in
+# the flatpak image exactly as laid out.
+echo "Hello from MyApp, installed through Orchard."
