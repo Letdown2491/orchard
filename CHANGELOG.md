@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.5.1 (2026-11-20)
+
+- **Corrected release notes.** The v0.5.0 tag froze the self manifest
+  before its notes were updated, so the 0.5.0 events on the relays
+  described 0.4.1's changes. 0.5.1 carries no code changes: the same
+  0.5.0 release republished under the notes it should have worn.
+
 ## v0.5.0 (2026-11-20)
 
 - **Native Linux packages (issue #1).** The release CI builds deb
