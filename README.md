@@ -16,7 +16,8 @@ client, not a gatekeeper.
   control and sign small Nostr events (listing, release, asset, profile)
   that describe it. `--prove` also drops a proof file into the linked
   source repository, so the repo link is a claim clients can check.
-  `PUBLISHING.md` is the guide, including a ready CI workflow.
+  `PUBLISHING.md` is the guide, including the reusable publish
+  workflow Orchard itself runs (one `uses:` job in your repo).
 - **The client** merges those events into a catalog beside Flathub's
   (read from your local AppStream), shows the sandbox permissions the
   artifact really carries, pins the release to its manifest digest, and
@@ -49,8 +50,9 @@ client, not a gatekeeper.
 
 Early but released. Orchard publishes itself, and every release ships
 through this repo's own workflow: tags land on the releases page as
-signed OCI artifacts, and the installed client updates through Orchard's
-own catalog. The full loop works end to end on real infrastructure:
+signed OCI artifacts and native packages (deb, rpm, apk, Arch pkg),
+and the installed client updates through Orchard's own catalog. The
+full loop works end to end on real infrastructure:
 publish, discover, verify, install, update, review. Multi-arch (x86_64
 and aarch64) builds in CI. Not built yet: signed-lineage folding for
 multi-publisher listings.
@@ -74,8 +76,12 @@ authenticates, and ghcr always challenges (see DESIGN.md); the Orchard
 client sidesteps this by downloading the verified artifact itself and
 installing from the local layout. The install is per-user (flatpak's
 system-scope image install is broken; see DESIGN.md), so no polkit
-password appears. Updates after that first install come through
-Orchard's own catalog, not the command line.
+password appears. Native packages (deb, rpm, Alpine apk, Arch pkg, for
+both arches) are on the releases page too, each wearing the same
+minisign signature. Updates after that first install run through the
+client's own registered remote (below): `flatpak update` sees Orchard's
+releases the way it sees any remote's, and the GUI offers them the
+ordinary way.
 
 Verify the first copy before installing it: every release artifact
 wears a minisign signature whose public half is committed in this repo
