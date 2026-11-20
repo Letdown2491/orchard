@@ -23,12 +23,15 @@
 
 use std::sync::{Arc, Mutex};
 
+pub mod web;
+
 use axum::extract::{Path as AxumPath, Query as AxumQuery, State};
-use axum::response::IntoResponse;
+use axum::http::header;
+use axum::response::{Html, IntoResponse};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 
-use orchard_core::CatalogFile;
+use orchard_core::model::{CatalogApp, CatalogFile};
 
 /// Annotation key Flatpak uses to map an OCI manifest to a flatpak ref.
 pub const ANNOTATION_FLATPAK_REF: &str = "org.flatpak.ref";
@@ -559,6 +562,8 @@ pub fn router(state: ServerState) -> Router {
         .route("/index/static", get(index_static))
         .route("/v2/", get(v2_ping))
         .route("/v2/{*rest}", get(v2_proxy))
+        .route("/apps", get(web_list))
+        .route("/apps/{app_id}", get(web_detail))
         .route("/v1/cache", post(clear_cache))
         .with_state(state)
 }
@@ -567,7 +572,7 @@ async fn root() -> Json<serde_json::Value> {
     Json(serde_json::json!({
         "service": "orchard-indexd",
         "description": "Orchard's local catalog service",
-        "endpoints": ["/v1/catalog", "/v1/reviews", "/v1/profiles", "/v1/graph", "/v1/relays", "/index/static", "/index/{arch}", "/v2/"]
+        "endpoints": ["/v1/catalog", "/v1/reviews", "/v1/profiles", "/v1/graph", "/v1/relays", "/index/static", "/index/{arch}", "/v2/", "/apps"]
     }))
 }
 
@@ -601,6 +606,101 @@ async fn index(
 
 async fn catalog(State(state): State<ServerState>) -> Json<CatalogFile> {
     Json(state.document.document())
+}
+
+/// The web page response: ETag revalidation on top of `no-cache`, so a
+/// visitor never renders a stale page and an unchanged page costs the
+/// server a 304.
+fn web_response(
+    if_none_match: Option<&axum::http::HeaderValue>,
+    body: String,
+) -> axum::response::Response {
+    let tag = web::etag(&body);
+    let matches = if_none_match
+        .and_then(|value| value.to_str().ok())
+        .map(|value| {
+            value
+                .split(',')
+                .map(|candidate| candidate.trim().trim_start_matches("W/"))
+                .any(|candidate| candidate == tag || candidate == "*")
+        })
+        .unwrap_or(false);
+    if matches {
+        return (
+            axum::http::StatusCode::NOT_MODIFIED,
+            [
+                (header::CACHE_CONTROL, web::cache_header()),
+                (header::ETAG, tag.as_str()),
+            ],
+        )
+            .into_response();
+    }
+    (
+        [
+            (header::CACHE_CONTROL, web::cache_header()),
+            (header::ETAG, tag.as_str()),
+        ],
+        Html(body),
+    )
+        .into_response()
+}
+
+/// The web-browsable catalog (issue #13): the list at /apps. The sort
+/// comes from ?sort= (updated by default, name as the alternative),
+/// rendered server-side with a toggle link.
+async fn web_list(
+    State(state): State<ServerState>,
+    AxumQuery(query): AxumQuery<std::collections::HashMap<String, String>>,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    let sort = web::Sort::from_query(query.get("sort").map(String::as_str));
+    let page = query
+        .get("page")
+        .and_then(|value| value.parse::<usize>().ok())
+        .map(|value| value.max(1))
+        .unwrap_or(1);
+    let document = state.document.document();
+    let body = web::list_page(&document.apps, sort, page);
+    web_response(headers.get(header::IF_NONE_MATCH), body)
+}
+
+/// The detail page at /apps/{app_id}; 404 when the id is not in the
+/// catalog.
+async fn web_detail(
+    State(state): State<ServerState>,
+    AxumPath(app_id): AxumPath<String>,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    let document = state.document.document();
+    // one row per release; the newest is the page, the rest are the
+    // versions list
+    let mut rows: Vec<CatalogApp> = document
+        .apps
+        .iter()
+        .filter(|app| app.app_id == app_id)
+        .cloned()
+        .collect();
+    let Some(_newest) = rows.first() else {
+        return axum::http::StatusCode::NOT_FOUND.into_response();
+    };
+    rows.sort_by(|a, b| b.published_at.cmp(&a.published_at));
+    // reviews for this app, newest first (the page renders the newest
+    // few in full and counts the rest)
+    let mut reviews: Vec<orchard_core::model::Review> = state
+        .document
+        .reviews()
+        .reviews
+        .iter()
+        .filter(|review| review.app_id == app_id)
+        .cloned()
+        .collect();
+    reviews.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    let base = state
+        .public_url
+        .clone()
+        .unwrap_or_else(|| "http://127.0.0.1:7780".to_string());
+    let body = web::detail_page(&base, &rows[0], &rows[1..], &reviews);
+    web_response(headers.get(header::IF_NONE_MATCH), body)
 }
 
 /// The reviews document, straight from the live feed.
@@ -929,7 +1029,7 @@ async fn v2_proxy(
                         return;
                     }
                 };
-                match agent.get(&url).set("Authorization", &token).call() {
+                match agent.get(&url).set("Authorization", &format!("Bearer {token}")).call() {
                     Ok(response) => response,
                     Err(err) => {
                         eprintln!("v2 proxy: post-token fetch failed: {err:#}");
