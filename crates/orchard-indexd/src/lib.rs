@@ -939,11 +939,63 @@ async fn v2_ping() -> &'static str {
     "{}"
 }
 
+/// A proxied fetch that failed, already shaped for the client: the
+/// status the client should see (the upstream registry's own answer
+/// where one exists) and a one-line reason in the body. An empty 502
+/// teaches a client nothing; a machine consumer pulling on a schedule
+/// needs the difference between "the registry says 404" and "the proxy
+/// failed", and a rate-limited one needs the upstream Retry-After.
+struct ProxyFailure {
+    status: axum::http::StatusCode,
+    reason: String,
+    retry_after: Option<axum::http::HeaderValue>,
+}
+
+impl ProxyFailure {
+    fn into_response(self) -> axum::response::Response {
+        let mut response = (
+            self.status,
+            [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+            self.reason,
+        )
+            .into_response();
+        if let Some(retry_after) = self.retry_after {
+            response
+                .headers_mut()
+                .insert(header::RETRY_AFTER, retry_after);
+        }
+        response
+    }
+}
+
+/// Relay an upstream registry's own non-success status to the client:
+/// a missing ref is the registry's 404, a rate limit its 429. Inventing
+/// a 502 here would misattribute the failure to this proxy.
+fn relay_upstream_status(
+    head_tx: tokio::sync::oneshot::Sender<Result<String, ProxyFailure>>,
+    code: u16,
+    response: ureq::Response,
+) {
+    let retry_after = response
+        .header("retry-after")
+        .and_then(|value| axum::http::HeaderValue::from_str(value).ok());
+    let failure = ProxyFailure {
+        status: axum::http::StatusCode::from_u16(code)
+            .unwrap_or(axum::http::StatusCode::BAD_GATEWAY),
+        reason: format!("upstream registry returned {code} for this ref"),
+        retry_after,
+    };
+    let _ = head_tx.send(Err(failure));
+}
+
 /// GET /v2/{rest}: proxy the OCI distribution API against the URLs the
 /// verified catalog carries. Manifests resolve against a row's
 /// `location`, blobs against its `oci_assets` entries. Everything is
 /// digest-addressed, so a row matches by exact URL tail and the bytes
-/// relayed are the bytes the publisher signed.
+/// relayed are the bytes the publisher signed. Failures propagate:
+/// the upstream registry's own status reaches the client as itself
+/// (with its Retry-After and a reason body), transport and token-dance
+/// failures are a 502 that says which.
 async fn v2_proxy(
     State(state): State<ServerState>,
     AxumPath(rest): AxumPath<String>,
@@ -997,7 +1049,7 @@ async fn v2_proxy(
     // round-trip here would stall the catalog and health endpoints for
     // its duration. The response head crosses back through a oneshot,
     // the body through a bounded channel.
-    let (head_tx, head_rx) = tokio::sync::oneshot::channel();
+    let (head_tx, head_rx) = tokio::sync::oneshot::channel::<Result<String, ProxyFailure>>();
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(8);
     std::thread::spawn(move || {
         let agent = upstream_agent();
@@ -1014,7 +1066,12 @@ async fn v2_proxy(
             Ok(response) => response,
             Err(ureq::Error::Status(401, denied)) => {
                 let Some(challenge) = denied.header("www-authenticate") else {
-                    let _ = head_tx.send(Err(axum::http::StatusCode::BAD_GATEWAY));
+                    eprintln!("v2 proxy: upstream 401 without a WWW-Authenticate header");
+                    let _ = head_tx.send(Err(ProxyFailure {
+                        status: axum::http::StatusCode::BAD_GATEWAY,
+                        reason: "upstream registry sent 401 without a token challenge".into(),
+                        retry_after: None,
+                    }));
                     return;
                 };
                 let token = match orchard_core::oci::token_from_challenge(
@@ -1025,7 +1082,11 @@ async fn v2_proxy(
                     Ok(token) => token,
                     Err(err) => {
                         eprintln!("v2 proxy: token fetch failed: {err:#}");
-                        let _ = head_tx.send(Err(axum::http::StatusCode::BAD_GATEWAY));
+                        let _ = head_tx.send(Err(ProxyFailure {
+                            status: axum::http::StatusCode::BAD_GATEWAY,
+                            reason: format!("token exchange failed: {err}"),
+                            retry_after: None,
+                        }));
                         return;
                     }
                 };
@@ -1040,16 +1101,36 @@ async fn v2_proxy(
                     .call()
                 {
                     Ok(response) => response,
+                    Err(ureq::Error::Status(code, response)) => {
+                        // the dance worked and the registry still said
+                        // no: that answer is the truth about this ref
+                        relay_upstream_status(head_tx, code, response);
+                        return;
+                    }
                     Err(err) => {
                         eprintln!("v2 proxy: post-token fetch failed: {err:#}");
-                        let _ = head_tx.send(Err(axum::http::StatusCode::BAD_GATEWAY));
+                        let _ = head_tx.send(Err(ProxyFailure {
+                            status: axum::http::StatusCode::BAD_GATEWAY,
+                            reason: format!("upstream unreachable after token exchange: {err}"),
+                            retry_after: None,
+                        }));
                         return;
                     }
                 }
             }
+            Err(ureq::Error::Status(code, response)) => {
+                // a real upstream answer that is not a challenge: hand
+                // it to the client as itself, not a made-up 502
+                relay_upstream_status(head_tx, code, response);
+                return;
+            }
             Err(err) => {
                 eprintln!("v2 proxy: fetch failed: {err:#}");
-                let _ = head_tx.send(Err(axum::http::StatusCode::BAD_GATEWAY));
+                let _ = head_tx.send(Err(ProxyFailure {
+                    status: axum::http::StatusCode::BAD_GATEWAY,
+                    reason: format!("upstream registry unreachable: {err}"),
+                    retry_after: None,
+                }));
                 return;
             }
         };
@@ -1080,14 +1161,22 @@ async fn v2_proxy(
             }
         }
     });
-    let Ok(Ok(content_type)) = head_rx.await else {
-        return axum::http::StatusCode::BAD_GATEWAY.into_response();
-    };
-    (
-        [(axum::http::header::CONTENT_TYPE, content_type)],
-        axum::body::Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx)),
-    )
-        .into_response()
+    match head_rx.await {
+        Ok(Ok(content_type)) => (
+            [(axum::http::header::CONTENT_TYPE, content_type)],
+            axum::body::Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx)),
+        )
+            .into_response(),
+        Ok(Err(failure)) => failure.into_response(),
+        // the thread died before reporting (panic, OOM kill): the
+        // client still deserves a body that says so
+        Err(_) => ProxyFailure {
+            status: axum::http::StatusCode::BAD_GATEWAY,
+            reason: "the proxy's relay thread exited before reporting".into(),
+            retry_after: None,
+        }
+        .into_response(),
+    }
 }
 
 /// One shared agent for every upstream registry fetch (the proxy and
@@ -1577,6 +1666,123 @@ mod tests {
         assert_eq!(image["Labels"]["org.flatpak.ref"], "app/com.orchard.Hello/x86_64/stable");
         // Registry resolves relative to the index URI: absolute when set
         assert_eq!(body["Registry"], "https://index.example.com");
+
+        server.abort();
+    }
+
+    /// An upstream registry serving an error status, for the proxy
+    /// propagation tests: the client asks indexd, indexd asks here.
+    async fn upstream_registry(status: axum::http::StatusCode, retry_after: &'static str) -> std::net::SocketAddr {
+        let handler = move || {
+            let mut response = axum::http::Response::builder()
+                .status(status)
+                .body(axum::body::Body::from("upstream says no\n"))
+                .unwrap();
+            if !retry_after.is_empty() {
+                response.headers_mut().insert(
+                    header::RETRY_AFTER,
+                    axum::http::HeaderValue::from_static(retry_after),
+                );
+            }
+            async move { response }
+        };
+        let app = axum::Router::new().fallback(axum::routing::any(handler));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        addr
+    }
+
+    /// A proxied ref the upstream registry answers with its own error
+    /// status reaches the client as that status, with the upstream's
+    /// Retry-After forwarded and a reason in the body: a rate-limited
+    /// machine consumer must learn 429, not a made-up bare 502.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn v2_proxy_relays_the_upstreams_own_status() {
+        let upstream = upstream_registry(axum::http::StatusCode::TOO_MANY_REQUESTS, "30").await;
+        let mut catalog = sample_catalog();
+        catalog.apps[0].location =
+            format!("http://{upstream}/v2/hello/manifests/sha256:00");
+        let router = router(ServerState {
+            document: Arc::new(catalog),
+            relays_reset: None,
+            relays_health: None,
+            public_url: None,
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+
+        let agent = ureq::AgentBuilder::new().build();
+        let result = agent
+            .get(&format!(
+                "http://{addr}/v2/hello/manifests/sha256:00"
+            ))
+            .call();
+        // ureq turns the propagated 429 into an Err of its own; the
+        // wire status is what the test asserts
+        let response = match result {
+            Err(ureq::Error::Status(code, response)) => {
+                assert_eq!(code, 429);
+                response
+            }
+            other => panic!("expected the upstream's 429, got {other:?}"),
+        };
+        assert_eq!(response.header("retry-after"), Some("30"));
+        let body = response.into_string().unwrap();
+        assert!(body.contains("429"), "reason should name the status: {body}");
+
+        server.abort();
+    }
+
+    /// An unreachable upstream is a 502, but one that says why: a
+    /// client (and the hosted operator reading its journal) sees the
+    /// difference between "registry unreachable" and other failures,
+    /// instead of an empty body.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn v2_proxy_transport_failure_carries_a_reason() {
+        // a port with no listener: connection refused, instantly
+        let dead = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dead_addr = dead.local_addr().unwrap();
+        drop(dead);
+
+        let mut catalog = sample_catalog();
+        catalog.apps[0].location =
+            format!("http://{dead_addr}/v2/hello/manifests/sha256:00");
+        let router = router(ServerState {
+            document: Arc::new(catalog),
+            relays_reset: None,
+            relays_health: None,
+            public_url: None,
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+
+        let agent = ureq::AgentBuilder::new().build();
+        let result = agent
+            .get(&format!(
+                "http://{addr}/v2/hello/manifests/sha256:00"
+            ))
+            .call();
+        let response = match result {
+            Err(ureq::Error::Status(code, response)) => {
+                assert_eq!(code, 502);
+                response
+            }
+            other => panic!("expected a 502, got {other:?}"),
+        };
+        let body = response.into_string().unwrap();
+        assert!(
+            body.contains("unreachable"),
+            "reason should say the upstream was unreachable: {body}"
+        );
 
         server.abort();
     }
