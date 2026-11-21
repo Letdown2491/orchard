@@ -320,8 +320,9 @@ pub fn list_page(apps: &[CatalogApp], sort: Sort, page_number: usize) -> String 
         format!(
             "<h1>Orchard <small>a permissionless Flatpak store</small></h1>\
              <p class=\"muted\">Publishers ship from their own registries and sign \
-             Nostr events; every artifact here is digest-pinned and the client \
-             re-verifies before install.</p>\
+             Nostr events; every artifact is digest-pinned and the client \
+             re-verifies before install. OCI-image artifacts only: a bundle-only \
+             <code>.flatpak</code> app never appears through a remote.</p>\
              <p class=\"sort\">Sorted by <b>{}</b> &middot; \
              <a href=\"/apps?sort={}\">{}</a></p>{cards}{nav}\
              <p class=\"muted\">Browse <a href=\"/v1/catalog\">/v1/catalog</a> for the \
@@ -651,6 +652,15 @@ mod tests {
         assert_eq!(page.matches("com.example.X").count(), 1);
         assert!(page.contains("v1.0.0"));
         assert!(!page.contains("v0.9.0"));
+    }
+
+    #[test]
+    fn list_page_says_the_catalog_is_an_oci_subset() {
+        // bundle-only .flatpak apps never appear through a remote
+        // (DESIGN.md): the store page says so up front
+        let page = list_page(&[sample_app("com.example.X", "1.0.0", 100)], Sort::Updated, 1);
+        assert!(page.contains("OCI-image artifacts only"));
+        assert!(page.contains("bundle-only"));
     }
 
     #[test]
