@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+- **Fixed: proxied fetch failures carry the upstream's real status
+  and a reason.** Every failure path in the indexd `/v2` proxy
+  answered a bare empty 502, which told a client nothing: an upstream
+  404 (missing ref), a 429 rate limit, and a dead relay thread were
+  indistinguishable from outside. The upstream registry's own status
+  now reaches the client as itself, with its Retry-After forwarded
+  and a one-line reason in the body; transport and token-dance
+  failures stay 502, but say which. This matters more as machine
+  consumers arrive (root-driven `--assumeyes` pulls from long-lived
+  machines need the 429 to back off), and it is the fix for the
+  hosted remote's opaque breakage: the empty 502 was indexd's own
+  shape, not the reverse proxy swallowing a body.
+
 ## v0.5.3 (2026-11-20)
 
 - **Fixed: proxied manifest fetches 404 after the token dance.** The
