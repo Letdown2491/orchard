@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.5.4 (2026-11-20)
 
 - **Fixed: proxied fetch failures carry the upstream's real status
   and a reason.** Every failure path in the indexd `/v2` proxy
@@ -13,7 +13,13 @@
   consumers arrive (root-driven `--assumeyes` pulls from long-lived
   machines need the 429 to back off), and it is the fix for the
   hosted remote's opaque breakage: the empty 502 was indexd's own
-  shape, not the reverse proxy swallowing a body.
+  shape, not the reverse proxy swallowing a body. The hosted remote
+  at apps.orchard.rocks was redeployed onto this release, which
+  closed the outage: its stale binary predated the v0.5.3 Accept fix
+  and every manifest fetch through the remote failed.
+- **The store page says what the remote serves.** The app list states
+  up front that the catalog covers OCI-image artifacts only: a
+  bundle-only `.flatpak` app never appears through a remote.
 
 ## v0.5.3 (2026-11-20)
 

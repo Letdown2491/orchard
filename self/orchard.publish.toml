@@ -12,11 +12,11 @@ repository = "https://github.com/Letdown2491/orchard"
 icon = "https://raw.githubusercontent.com/Letdown2491/orchard/main/assets/orchard-512.png"
 
 [release]
-version = "0.5.3"
+version = "0.5.4"
 arch = "linux-x86_64"
 # Every declared platform must be present in the combined release.
 platforms = ["linux-x86_64", "linux-aarch64"]
-notes = "This release ships the store's own plumbing: the catalog serves as a real flatpak remote (updates run through flatpak itself, the uninstall-then-install seam retired), native deb/rpm/apk/Arch packages with a minisign-signed first copy, publishing extracted to a reusable workflow, and per-relay health badges in Settings."
+notes = "The store's flatpak remote got honest failures: the /v2 proxy now passes the registry's own status codes through (a rate limit is a 429, not a bare 502) with a reason in the body, and the store page says the catalog covers OCI-image artifacts only."
 
 [artifact]
 tree = "tree"
